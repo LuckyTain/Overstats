@@ -29,6 +29,7 @@ try:
         normalize_treemap_mode,
     )
     from overstats.src.modules.query_tool import ensure_query_tool_assets, load_query_tool
+    from overstats.src.modules.season_config import get_dashen_current_season
     from overstats.src.modules.dashen_match import DashenMatchQuery, dashen_match_module
     from overstats.src.modules.dashen_sameplay import DashenSameplayQuery, dashen_sameplay_module
     from overstats.src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
@@ -81,6 +82,7 @@ except ModuleNotFoundError:
         normalize_treemap_mode,
     )
     from src.modules.query_tool import ensure_query_tool_assets, load_query_tool
+    from src.modules.season_config import get_dashen_current_season
     from src.modules.dashen_match import DashenMatchQuery, dashen_match_module
     from src.modules.dashen_sameplay import DashenSameplayQuery, dashen_sameplay_module
     from src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
@@ -1853,6 +1855,50 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def do_GET(self) -> None:
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            if path == "/api/v2/meta/seasons":
+                current_season = get_dashen_current_season(query_tool_config)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "current_season": current_season,
+                        "recent_seasons": [
+                            season
+                            for season in range(current_season, max(current_season - 3, 0), -1)
+                        ],
+                    },
+                )
+                return
+            if path == "/api/v2/meta/profile-assets":
+                level_icons = query_tool_config.get("appreciationLevelIcon")
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "appreciation_level_icons": level_icons if isinstance(level_icons, dict) else {},
+                    },
+                )
+                return
+            if path.startswith("/api/v2/meta/profile-assets/"):
+                level = path.rsplit("/", 1)[-1]
+                level_icons = query_tool_config.get("appreciationLevelIcon")
+                icon_url = level_icons.get(level) if isinstance(level_icons, dict) else ""
+                if not icon_url:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "profile_asset_not_found"})
+                    return
+                try:
+                    image_body = async_runner.run(dashen_api_client.get_icon_proxy(str(icon_url)))
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"ok": False, "error": "profile_asset_unavailable", "message": str(exc)},
+                    )
+                    return
+                if not image_body:
+                    self._send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "profile_asset_unavailable"})
+                    return
+                self._send_binary(HTTPStatus.OK, image_body, "image/png")
+                return
             if path == "/healthz":
                 self._send_json(
                     HTTPStatus.OK,
