@@ -38,6 +38,7 @@ from .enhanced_render import (
     render_analysis_report,
     render_player_hero_detail,
 )
+from .hero_knowledge import build_match_hero_knowledge
 from .render import (
     RenderedImage,
     _extract_match_detail_data,
@@ -199,6 +200,14 @@ class DashenMatchRepliesOutput:
     replies: List[Dict[str, Any]] = field(default_factory=list)
     match_id: str = ""
     match_kind: str = ""
+
+
+@dataclass(frozen=True)
+class DashenMatchAnalysisOutput:
+    customer_token: str
+    match_id: str
+    match_kind: str
+    analysis: Dict[str, Any] = field(default_factory=dict)
 
 
 class DashenMatchModule:
@@ -454,6 +463,90 @@ class DashenMatchModule:
             match_kind=detail.match_kind,
         )
 
+    async def query_match_detail_analysis(
+        self,
+        *,
+        customer_token: str,
+        match_id: str,
+    ) -> DashenMatchAnalysisOutput:
+        """Build full-roster AI analysis without rendering any image replies."""
+        customer_token = str(customer_token or "").strip()
+        match_id = str(match_id or "").strip()
+        if not customer_token:
+            raise ModuleError(
+                error="missing_customer_token",
+                message="customer_token is required for match analysis.",
+                status_code=400,
+            )
+        if not match_id:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="match_id is required for match analysis.",
+                status_code=400,
+            )
+
+        detail = await self._get_match_detail_direct(customer_token, match_id)
+        if detail.match_kind == "fight":
+            raise ModuleError(
+                error="analysis_not_supported",
+                message="Structured AI analysis is not available for fight matches.",
+                status_code=400,
+            )
+
+        match_data = _extract_match_detail_data(detail.payload)
+        try:
+            card_payload = await self._fetch_cached_player_card(customer_token)
+        except Exception:
+            card_payload = {}
+        card_data = card_payload.get("data") if isinstance(card_payload, dict) and isinstance(card_payload.get("data"), dict) else {}
+        primary_player = next(
+            (
+                dict(player)
+                for player in list(match_data.get("teammateList") or []) + list(match_data.get("enemyList") or [])
+                if isinstance(player, dict) and str(player.get("name") or "").strip().lower() == str(card_data.get("name") or "").strip().lower()
+            ),
+            {},
+        )
+        if not primary_player:
+            primary_player = next(
+                (
+                    dict(player)
+                    for player in list(match_data.get("teammateList") or []) + list(match_data.get("enemyList") or [])
+                    if isinstance(player, dict) and (player.get("heroList") or match_data.get("heroList"))
+                ),
+                {},
+            )
+        query_full_id = str(primary_player.get("name") or card_data.get("name") or f"token:{customer_token[:8]}").strip()
+        player_details, target_id = await self._build_all_player_details(
+            match_data,
+            detail.match_id,
+            query_full_id=query_full_id,
+            query_bnet_id=str(primary_player.get("bnetId") or "").strip(),
+        )
+        built = await self._build_ai_analysis(
+            match_data=match_data,
+            all_player_details=player_details,
+            target_id=target_id,
+        )
+        raw_analysis = built.get("json")
+        if not isinstance(raw_analysis, dict):
+            raise ModuleError(
+                error="analysis_failed",
+                message=str(built.get("fallback_text") or "AI analysis could not be generated."),
+                status_code=502,
+            )
+        return DashenMatchAnalysisOutput(
+            customer_token=customer_token,
+            match_id=detail.match_id,
+            match_kind=detail.match_kind,
+            analysis=self._normalize_match_analysis(
+                raw_analysis,
+                match_data=match_data,
+                all_player_details=player_details,
+                target_id=target_id,
+            ),
+        )
+
     async def query_match_list_by_bnet_id(
         self,
         bnet_id: str,
@@ -679,7 +772,17 @@ class DashenMatchModule:
                 "success": bool(root.get("heroList")),
             }
 
-        results = await asyncio.gather(*(fetch_target(item) for item in all_targets), return_exceptions=True)
+        # Dashen may throttle a burst of player-card / match-detail lookups.
+        # This method is used by the all-player analysis path, so fetching a
+        # ten-player roster concurrently can turn one user action into dozens
+        # of upstream requests at once. Keep the roster walk serial; the
+        # per-player cache still avoids repeated network work on later runs.
+        results: List[Dict[str, Any] | BaseException] = []
+        for target in all_targets:
+            try:
+                results.append(await fetch_target(target))
+            except Exception as exc:
+                results.append(exc)
         valid: List[Dict[str, Any]] = []
         for result in results:
             if isinstance(result, Exception) or not isinstance(result, dict):
@@ -767,71 +870,75 @@ class DashenMatchModule:
         summary_text = generate_match_summary_text(match_data, target_id)
         detailed_text = generate_detailed_stats_text(all_player_details, target_id)
         score_bundle = calculate_match_scores(match_data)
+        # Prompt data must contain JSON primitives only. PIL Image instances
+        # are useful to the legacy image renderer but cannot be serialized.
+        carry_index_data = build_carry_index_data(match_data, include_image_icons=False)
+        try:
+            hero_knowledge = build_match_hero_knowledge(match_data, all_player_details, _load_ow_config())
+        except Exception as exc:
+            print(f"[overstats] failed to build match hero knowledge: {exc}")
+            hero_knowledge = {"available": False, "heroes": [], "players": []}
+        hero_knowledge_json = json.dumps(hero_knowledge, ensure_ascii=False)
         persona_prompt = str(getattr(app_config, "ANALYSIS_PERSONA_PROMPT", "") or "").strip()
-        if persona_prompt:
-            persona_prompt = persona_prompt.format(
-                target_id=target_id,
-                anti_pressure=score_bundle["anti_pressure"],
-                teamwork=score_bundle["teamwork"],
-                aggressiveness=score_bundle["aggressiveness"],
-                match_quality=score_bundle["match_quality"],
-            )
+        template = str(getattr(app_config, "ANALYSIS_MATCH_PROMPT", "") or "").strip()
+        if not template:
+            template = "Analyze the supplied Overwatch match data objectively."
+        replacements = {
+            "{target_id}": target_id,
+            "{match_summary}": summary_text,
+            "{player_details}": detailed_text,
+            "{carry_index_data}": json.dumps(carry_index_data, ensure_ascii=False),
+            "{attribute_scores}": json.dumps(score_bundle, ensure_ascii=False),
+            "{hero_knowledge}": hero_knowledge_json,
+        }
+        for placeholder, value in replacements.items():
+            template = template.replace(placeholder, value)
+        response_schema = {
+            "players": [{
+                "player_id": "exact BattleTag from input",
+                "rating": "S/A/B/C/D",
+                "headline": "20-40 Chinese characters",
+                "analysis": "50-120 Chinese characters",
+                "advice": "40-100 Chinese characters; actionable and based on visible match evidence",
+            }],
+            "match": {
+                "win_condition": {"title": "唯一胜负手", "analysis": "one decisive factor and evidence"},
+                "mvp": {"player_id": "exact BattleTag", "reason": "evidence"},
+                "liability": {"player_id": "exact BattleTag or empty string", "reason": "evidence or no clear liability"},
+                "summary": "20-40 Chinese characters",
+            },
+        }
+        knowledge_block = ""
+        if hero_knowledge.get("available"):
+            knowledge_block = f"""
 
+[Local hero review knowledge for heroes actually used in this match]
+{hero_knowledge_json}
+
+The fixed carry_index_data score is authoritative. Hero knowledge may explain visible metrics and guide advice, but must not alter that score. Treat suggestion rules as review directions, never as proof that an event occurred. Do not invent ability hits, positioning, timing, or decisions absent from the supplied data.
+""".rstrip()
         prompt = f"""
 {persona_prompt}
-【助攻判读补充规则】
-不要把“助攻低”或“没有助攻”机械地当成负面结论。对于坦克位和输出位，助攻不是通用核心指标。很多英雄的技能机制、收割定位、爆发击杀方式或单点作战方式，本来就不容易稳定获得助攻。除非该英雄本身明显依赖团队增益、控制、挂状态或持续参与混战，且同场其他数据也能证明其协同性偏低，否则禁止写出无意义的“零助攻/助攻少所以表现差”评价。
+{template}
 
-【身份】
-请扮演一位资深的电竞数据分析师，根据提供的比赛数据，输出一份犀利、简明扼要的分析报告。
+【服务端计算的全场表现评分 carry_index_data】
+{json.dumps(carry_index_data, ensure_ascii=False)}
 
-【输出要求】
-1. 必须严格使用中文，只输出纯 JSON，不要 markdown，不要解释，不要前后缀。
-2. 分析必须专业、简明、直接，结论要清晰，不能硬夸，不能胡编。
-3. 所有判断都必须以给定数据为准，不得虚构不存在的对局细节。
-4. 如果 JSON 字符串内部需要双引号，请转义为 \\\"，避免输出非法 JSON。
+【查询方队伍属性评分 attribute_scores】
+{json.dumps(score_bundle, ensure_ascii=False)}
 
-【任务】
-1. 客观给焦点玩家评分，只能填 S/A/B/C/D。
-2. 用一句话指出焦点玩家最大优点或最大问题。
-3. 只写一个最关键的胜负手。
-4. 必须明确点出真正的 MVP 或背锅位，不能强行偏袒焦点玩家。
-5. 必须严格比较三路：坦克位、输出位、辅助位。
-6. 要写出最突出的个人表现、关键数据差距，或者同英雄对位 Diff。
-7. `attribute_scores` 的数值必须原样保留，不允许改动。
-
-【输出 JSON 模板】
-{{
-  "player_id": "{target_id}",
-  "score": "S/A/B/C/D",
-  "general_summary": "一句话核心总结",
-  "key_to_win_loss": "决定胜负的唯一核心点",
-  "red_black_list": {{
-    "mvp_or_potg": "真正的 MVP 或背锅位及依据",
-    "role_comparison": [
-      "坦克位：[双方对比结论]",
-      "输出位：[双方对比结论]",
-      "辅助位：[双方对比结论]"
-    ],
-    "outstanding_performance": "最突出的个人表现、关键数据差距或同英雄对位 Diff"
-  }},
-  "summary": "一句话总结本场整体观感",
-  "attribute_scores": {{
-    "anti_pressure": {score_bundle["anti_pressure"]},
-    "teamwork": {score_bundle["teamwork"]},
-    "aggressiveness": {score_bundle["aggressiveness"]},
-    "match_quality": {score_bundle["match_quality"]}
-  }},
-  "evaluation": "基于四项属性分的针对性评价",
-  "extra": "100字以内的人格化鼓励/安慰/小结",
-  "carry_index_data": []
-}}
-
-【原始比赛数据如下】
+【比赛面板数据】
 {summary_text}
 --------------------------------------------------
+【全员英雄详细数据】
 {detailed_text}
+{knowledge_block}
 --------------------------------------------------
+【硬性输出要求】
+只输出合法 JSON，禁止 Markdown、解释、前后缀。players 必须覆盖比赛面板全部玩家且保持面板顺序；player_id 必须精确使用输入中的完整 BattleTag；rating 仅能是 S/A/B/C/D。
+Do not cite, infer, or construct historical averages, medians, percentiles, global benchmarks, or rank benchmarks. No historical reference sample is supplied to the model. Evaluate players only from the explicitly supplied match data, carry_index_data, and hero knowledge.
+如果一个玩家表现较差，对该玩家提供建议。建议必须指出本场比赛中明显的优势或劣势，且不得将知识库回顾方向作为观察到的事件呈现。建议可以是更换其他英雄以反制对方。
+{json.dumps(response_schema, ensure_ascii=False, indent=2)}
 """.strip()
 
         base_url = str(getattr(app_config, "ANALYSIS_BASE_URL", "") or "").strip()
@@ -853,7 +960,6 @@ class DashenMatchModule:
             )
             parsed = _parse_analysis_json(_extract_llm_message_content(raw))
             if parsed:
-                parsed["carry_index_data"] = build_carry_index_data(match_data)
                 return {
                     "json": parsed,
                     "footer_source": "AI锐评",
@@ -861,6 +967,93 @@ class DashenMatchModule:
             return {"fallback_text": f"AI锐评生成失败。错误：invalid json ({model})"}
         except Exception as exc:
             return {"fallback_text": f"AI锐评生成失败。错误：{type(exc).__name__}: {exc}"}
+
+    def _normalize_match_analysis(
+        self,
+        raw: Dict[str, Any],
+        *,
+        match_data: Dict[str, Any],
+        all_player_details: List[Dict[str, Any]],
+        target_id: str,
+    ) -> Dict[str, Any]:
+        """Keep model prose, but anchor roster and scores to real match data."""
+        roster: List[Dict[str, str]] = []
+        for team_name, players in (("teammate", match_data.get("teammateList") or []), ("enemy", match_data.get("enemyList") or [])):
+            for player in players:
+                if not isinstance(player, dict):
+                    continue
+                player_id = str(player.get("name") or "").strip()
+                if player_id:
+                    roster.append({"player_id": player_id, "team": team_name})
+        raw_players = raw.get("players") if isinstance(raw.get("players"), list) else []
+        raw_by_id = {
+            str(item.get("player_id") or item.get("id") or "").strip().lower(): item
+            for item in raw_players
+            if isinstance(item, dict)
+        }
+        detail_by_id = {
+            str(item.get("name") or "").strip().lower(): item
+            for item in all_player_details
+            if isinstance(item, dict)
+        }
+        # The structured endpoint returns this list directly as JSON, so do
+        # not attach the PIL icons used by the legacy report renderer.
+        carry_index_data = build_carry_index_data(match_data, include_image_icons=False)
+        carry_by_id = {
+            str(item.get("player_id") or "").strip().lower(): item
+            for item in carry_index_data
+            if isinstance(item, dict)
+        }
+        players: List[Dict[str, Any]] = []
+        for roster_player in roster:
+            player_id = roster_player["player_id"]
+            source = raw_by_id.get(player_id.lower(), {})
+            carry = carry_by_id.get(player_id.lower(), {})
+            detail = detail_by_id.get(player_id.lower(), {})
+            rating = str(source.get("rating") or source.get("score") or "B").upper()
+            if rating not in {"S", "A", "B", "C", "D"}:
+                rating = "B"
+            players.append({
+                "player_id": player_id,
+                "display_name": player_id.split("#", 1)[0],
+                "team": roster_player["team"],
+                "rating": rating,
+                "headline": str(source.get("headline") or source.get("general_summary") or "未返回有效的一句话点评。"),
+                "analysis": str(source.get("analysis") or source.get("evaluation") or "未返回该玩家的详细分析。"),
+                "carry_score": int(carry.get("score") or 0),
+                "advice": str(source.get("advice") or source.get("suggestion") or source.get("recommendation") or "\u6682\u65e0\u57fa\u4e8e\u672c\u5c40\u6570\u636e\u7684\u660e\u786e\u6539\u8fdb\u5efa\u8bae\u3002"),
+                "carry_rank": 0,
+                "hero_guid": str(carry.get("hero_guid") or ""),
+                "hero_icon": str(carry.get("hero_icon") or ""),
+                "icon": str(detail.get("icon") or ""),
+            })
+        players.sort(key=lambda item: int(item["carry_score"]), reverse=True)
+        for rank, player in enumerate(players, start=1):
+            player["carry_rank"] = rank
+
+        raw_match = raw.get("match") if isinstance(raw.get("match"), dict) else raw
+
+        def card(value: Any, fallback_title: str) -> Dict[str, str]:
+            source = value if isinstance(value, dict) else {}
+            return {
+                "title": str(source.get("title") or fallback_title),
+                "player_id": str(source.get("player_id") or ""),
+                "reason": str(source.get("reason") or source.get("analysis") or value or "未返回有效结论。"),
+            }
+
+        return {
+            "schema_version": "v2",
+            "target_player_id": target_id,
+            "generated_at": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
+            "carry_index_data": carry_index_data,
+            "players": players,
+            "match": {
+                "win_condition": card(raw_match.get("win_condition") or raw.get("key_to_win_loss"), "唯一胜负手"),
+                "mvp": card(raw_match.get("mvp"), "MVP"),
+                "liability": card(raw_match.get("liability") or raw_match.get("scapegoat"), "背锅位"),
+                "summary": str(raw_match.get("summary") or raw.get("summary") or "未返回有效的一句话总结。"),
+            },
+        }
 
     def _chat_completion_url(self, base_url: str) -> str:
         base = str(base_url or "").rstrip("/")

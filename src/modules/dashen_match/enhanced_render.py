@@ -346,19 +346,22 @@ def _hero_stat_rows(
     hero: dict[str, Any],
     *,
     rank_info: Optional[dict[str, Any]] = None,
+    include_reference: bool = True,
 ) -> list[dict[str, Any]]:
     hero_guid = str(hero.get("heroGuid") or hero.get("heroId") or "")
     stat_map = hero.get("statMap", {}) or {}
     if not hero_guid or not stat_map:
         return []
     attr_lookup = _hero_attr_lookup(config).get(hero_guid, {})
-    compare_map = _build_hero_average_comparison(
-        config,
-        hero_guid,
-        stat_map,
-        stat_map.get(GAME_TIME_GUID, 0),
-        (rank_info or {}).get("rankScore"),
-    )
+    compare_map = {}
+    if include_reference:
+        compare_map = _build_hero_average_comparison(
+            config,
+            hero_guid,
+            stat_map,
+            stat_map.get(GAME_TIME_GUID, 0),
+            (rank_info or {}).get("rankScore"),
+        )
     preferred_order = {KILL_GUID: 0, ASSIST_GUID: 1, DEATH_GUID: 2, FINAL_HIT_GUID: 3}
     rows = []
     for raw_guid, raw_value in stat_map.items():
@@ -1216,15 +1219,23 @@ def generate_detailed_stats_text(all_player_details: Sequence[dict[str, Any]], t
             hero_info = _find_hero(config, hero.get("heroGuid") or hero.get("heroId"))
             hero_name = hero_info.get("name") or f"未知英雄（{hero.get('heroGuid') or hero.get('heroId')}）"
             lines.append(f"- 英雄：{hero_name}")
-            for row in _hero_stat_rows(config, hero, rank_info=player.get("rankInfo") or {}):
-                avg_suffix = f"（均值 {row['avg_text']}）" if row.get("avg_text") not in {"", "-"} else ""
-                lines.append(f"  * {row['label']}：{row['value_text']}{avg_suffix}")
+            for row in _hero_stat_rows(
+                config,
+                hero,
+                rank_info=player.get("rankInfo") or {},
+                include_reference=False,
+            ):
+                lines.append(f"  * {row['label']}：{row['value_text']}")
             lines.append("")
         lines.append("")
     return "\n".join(lines)
 
 
-def build_carry_index_data(match_data: dict[str, Any]) -> list[dict[str, Any]]:
+def build_carry_index_data(
+    match_data: dict[str, Any],
+    *,
+    include_image_icons: bool = True,
+) -> list[dict[str, Any]]:
     config = _load_ow_config()
     game_time = float(match_data.get("gameTimeSec") or 600 or 600)
     time_coef = max(1.0, game_time) / 600.0
@@ -1255,13 +1266,25 @@ def build_carry_index_data(match_data: dict[str, Any]) -> list[dict[str, Any]]:
             ) / time_coef
 
             hero_info = _resolve_player_hero(config, player)
-            hero_icon = _load_icon_rgba(_hero_icon_url(hero_info, player), size=(24, 24))
+            hero_guid = str(
+                player.get("heroGuid")
+                or player.get("heroId")
+                or hero_info.get("heroGuid")
+                or hero_info.get("guid")
+                or hero_info.get("id")
+                or ""
+            ).strip()
+            hero_icon_url = _hero_icon_url(hero_info, player)
+            hero_icon = _load_icon_rgba(hero_icon_url, size=(24, 24)) if include_image_icons else None
             carry_index_data.append(
                 {
+                    "player_id": str(player.get("name") or "unknown"),
                     "name": str(player.get("name") or "未知").split("#", 1)[0],
                     "team": team_label,
                     "score": int(round(score)),
-                    "icon": hero_icon,
+                    "hero_guid": hero_guid,
+                    "hero_icon": hero_icon_url,
+                    **({"icon": hero_icon} if include_image_icons else {}),
                 }
             )
 

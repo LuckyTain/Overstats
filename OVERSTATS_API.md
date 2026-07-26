@@ -890,6 +890,7 @@ The `/image` endpoint returns `image/png` in the same visual family as quick str
 - `POST /api/v2/dashen-match/detail`
 - `POST /api/v2/dashen-match/detail/image`
 - `POST /api/v2/dashen-match/detail/replies`
+- `POST /api/v2/dashen-match/detail/analysis`
 
 详情请求方式二选一：
 
@@ -900,6 +901,44 @@ The `/image` endpoint returns `image/png` in the same visual family as quick str
 
 - `show_all_heroes: bool`
 - `analyze: bool`
+
+**`POST /api/v2/dashen-match/detail/analysis`** only accepts `customer_token + match_id` and returns JSON AI analysis without rendering images:
+
+```json
+{
+  "ok": true,
+  "match_id": "...",
+  "match_kind": "normal",
+  "analysis": {
+    "schema_version": "v2",
+    "target_player_id": "Player#12345",
+    "generated_at": "2026-07-26 12:34",
+    "carry_index_data": [
+      { "player_id": "Player#12345", "name": "Player", "team": "teammate", "score": 12345 }
+    ],
+    "players": [
+      {
+        "player_id": "Player#12345",
+        "display_name": "Player",
+        "team": "teammate",
+        "rating": "A",
+        "headline": "20-40 character short review",
+        "analysis": "50-120 character data analysis",
+        "carry_score": 12345,
+        "carry_rank": 1
+      }
+    ],
+    "match": {
+      "win_condition": { "title": "唯一胜负手", "reason": "..." },
+      "mvp": { "title": "MVP", "player_id": "...", "reason": "..." },
+      "liability": { "title": "背锅位", "player_id": "...", "reason": "..." },
+      "summary": "一句话总结"
+    }
+  }
+}
+```
+
+Configure the full editable model instructions with `ANALYSIS_MATCH_PROMPT` in `config/config.py`. It supports `{target_id}`, `{match_summary}`, `{player_details}`, `{carry_index_data}`, and `{attribute_scores}` placeholders. `ANALYSIS_PERSONA_PROMPT` is retained as an optional prefix.
 
 **`/api/v2/dashen-match/detail` 返回结构：**
 

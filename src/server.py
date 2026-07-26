@@ -1262,6 +1262,12 @@ class OverstatsCoreService:
             lambda: self._handle_dashen_match_detail_replies(payload),
         )
 
+    async def handle_dashen_match_detail_analysis(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "match_detail_analysis",
+            lambda: self._handle_dashen_match_detail_analysis(payload),
+        )
+
     async def _handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
@@ -1399,6 +1405,21 @@ class OverstatsCoreService:
             "match_id": result.match_id,
             "match_kind": result.match_kind,
             "replies": result.replies,
+        }
+
+    async def _handle_dashen_match_detail_analysis(self, payload: Dict[str, object]) -> Dict[str, object]:
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        result = await dashen_match_module.query_match_detail_analysis(
+            customer_token=customer_token,
+            match_id=match_id,
+        )
+        return {
+            "ok": True,
+            "customer_token": result.customer_token,
+            "match_id": result.match_id,
+            "match_kind": result.match_kind,
+            "analysis": result.analysis,
         }
 
     async def handle_dashen_match_detail_image(self, payload: Dict[str, object]) -> bytes:
@@ -2036,6 +2057,10 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             if path == "/api/v2/dashen-match/detail/replies":
                 self._handle_dashen_match_detail_replies_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/analysis":
+                self._handle_dashen_match_detail_analysis_post()
                 return
 
             if path == "/api/v2/dashen-match/detail/image":
@@ -4036,6 +4061,22 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
 
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_analysis_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": str(exc)})
+                return
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis(payload))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error. See details.", "details": {"exception": type(exc).__name__, "message": str(exc)}})
+                return
             self._send_json(HTTPStatus.OK, result)
 
         def _handle_dashen_match_detail_image_post(self) -> None:
