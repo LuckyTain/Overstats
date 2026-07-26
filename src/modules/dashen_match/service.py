@@ -66,6 +66,107 @@ _PLAYER_CARD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _REPLY_CONTEXT_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 
 
+_CARRY_CLAIM_RE = re.compile(
+    r"[^，,。！？!?；;\n]*(?:carry\s*index|carry\s*指数|carry指数|全场表现评分)"
+    r"[^，,。！？!?；;\n]*(?:[，,。！？!?；;]|$)",
+    flags=re.IGNORECASE,
+)
+_MODEL_SUPERLATIVE_RE = re.compile(
+    r"(?:全场|本场|双方|队内|全队|己方|敌方|本队|对方|同职责(?:内)?|同位置(?:内)?)"
+    r"(?:数据)?(?:并列)?(?:最多|最少|最高|最低|第[一1](?:名)?|倒数第[一1](?:名)?|垫底)"
+    r"|(?:高于|低于)(?:全场|本场|双方|队内|己方|敌方|本队|对方)?所有(?:选手|玩家|人)"
+)
+
+
+def _sanitize_model_analysis_text(value: Any, fallback: str = "") -> str:
+    """Keep model prose, but remove claims owned by deterministic server facts."""
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    text = text.replace("焦点玩家", "")
+    text = _CARRY_CLAIM_RE.sub("", text)
+    text = _MODEL_SUPERLATIVE_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" ，,。；;\n\t")
+    return text or fallback
+
+
+def _build_match_stat_facts(
+    match_data: Dict[str, Any],
+    carry_index_data: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build global, deterministic scoreboard facts for the LLM and response."""
+    metric_fields = {
+        "kills": ("kill",),
+        "assists": ("assist",),
+        "deaths": ("death",),
+        "final_hits": ("finalBlows", "finalHit"),
+        "objective_time": ("targetCompetingTime",),
+        "hero_damage": ("heroDamage",),
+        "damage_taken": ("damageTaken",),
+        "healing": ("cure",),
+        "healing_taken": ("healingTaken",),
+        "damage_mitigated": ("resistDamage",),
+    }
+    carry_by_id = {
+        str(item.get("player_id") or "").strip().lower(): item
+        for item in carry_index_data
+        if isinstance(item, dict)
+    }
+    players: List[Dict[str, Any]] = []
+    for team, player_list in (("teammate", match_data.get("teammateList") or []), ("enemy", match_data.get("enemyList") or [])):
+        for player in player_list:
+            if not isinstance(player, dict):
+                continue
+            player_id = str(player.get("name") or "").strip()
+            carry = carry_by_id.get(player_id.lower(), {})
+            metrics: Dict[str, Any] = {}
+            for metric, candidates in metric_fields.items():
+                raw_value: Any = 0
+                for field_name in candidates:
+                    if player.get(field_name) is not None:
+                        raw_value = player.get(field_name)
+                        break
+                try:
+                    numeric = float(raw_value or 0)
+                    metrics[metric] = int(numeric) if numeric.is_integer() else round(numeric, 2)
+                except (TypeError, ValueError):
+                    metrics[metric] = 0
+            players.append({
+                "player_id": player_id,
+                "team": team,
+                "role": str(carry.get("role") or ""),
+                "metrics": metrics,
+            })
+
+    extrema: Dict[str, Dict[str, Any]] = {}
+    for metric in metric_fields:
+        values = [float(item["metrics"].get(metric, 0) or 0) for item in players]
+        if not values:
+            continue
+        maximum = max(values)
+        minimum = min(values)
+        extrema[metric] = {
+            "max_value": int(maximum) if maximum.is_integer() else round(maximum, 2),
+            "max_player_ids": [
+                item["player_id"]
+                for item in players
+                if float(item["metrics"].get(metric, 0) or 0) == maximum
+            ],
+            "min_value": int(minimum) if minimum.is_integer() else round(minimum, 2),
+            "min_player_ids": [
+                item["player_id"]
+                for item in players
+                if float(item["metrics"].get(metric, 0) or 0) == minimum
+            ],
+        }
+    return {
+        "scope": "all_players",
+        "player_count": len(players),
+        "players": players,
+        "extrema": extrema,
+    }
+
+
 def _cache_get(cache: OrderedDict, key: Any) -> Any:
     with _CACHE_LOCK:
         item = cache.get(key)
@@ -873,6 +974,7 @@ class DashenMatchModule:
         # Prompt data must contain JSON primitives only. PIL Image instances
         # are useful to the legacy image renderer but cannot be serialized.
         carry_index_data = build_carry_index_data(match_data, include_image_icons=False)
+        match_stat_facts = _build_match_stat_facts(match_data, carry_index_data)
         try:
             hero_knowledge = build_match_hero_knowledge(match_data, all_player_details, _load_ow_config())
         except Exception as exc:
@@ -884,10 +986,11 @@ class DashenMatchModule:
         if not template:
             template = "Analyze the supplied Overwatch match data objectively."
         replacements = {
-            "{target_id}": target_id,
+            "{target_id}": "",
             "{match_summary}": summary_text,
             "{player_details}": detailed_text,
             "{carry_index_data}": json.dumps(carry_index_data, ensure_ascii=False),
+            "{match_stat_facts}": json.dumps(match_stat_facts, ensure_ascii=False),
             "{attribute_scores}": json.dumps(score_bundle, ensure_ascii=False),
             "{hero_knowledge}": hero_knowledge_json,
         }
@@ -897,8 +1000,8 @@ class DashenMatchModule:
             "players": [{
                 "player_id": "exact BattleTag from input",
                 "rating": "S/A/B/C/D",
-                "headline": "20-40 Chinese characters",
-                "analysis": "50-120 Chinese characters",
+                "headline": "20-40 Chinese characters; no focal-player wording, Carry Index claims, or self-calculated superlatives",
+                "analysis": "50-120 Chinese characters; no Carry Index claims or self-calculated superlatives",
                 "advice": "40-100 Chinese characters; actionable and based on visible match evidence",
             }],
             "match": {
@@ -916,6 +1019,18 @@ class DashenMatchModule:
 {hero_knowledge_json}
 
 The fixed carry_index_data score is authoritative. Hero knowledge may explain visible metrics and guide advice, but must not alter that score. Treat suggestion rules as review directions, never as proof that an event occurred. Do not invent ability hits, positioning, timing, or decisions absent from the supplied data.
+Do not cite, infer, or construct historical averages, medians, percentiles, global benchmarks, or rank benchmarks. No historical reference sample is supplied to the model. Evaluate players only from the explicitly supplied match data, carry_index_data, and hero knowledge.
+如果一个玩家表现较差，对该玩家提供建议。建议必须指出本场比赛中明显的优势或劣势，且不得将知识库回顾方向作为观察到的事件呈现。建议可以是更换其他英雄以反制对方。
+""".rstrip()
+        fact_policy_block = f"""
+
+[Server-verified global match facts]
+{json.dumps(match_stat_facts, ensure_ascii=False)}
+
+This is a global review of all players. There is no focal player, favored player, or player that should receive extra attention. The request's customer token and target_id are data-fetching context only and must not influence ratings, MVP, liability, wording, or analysis priority.
+carry_index_data is already calculated and sorted by the server. Its score, overall_rank, team_rank, role_rank, and team_role_rank fields are authoritative. Never calculate, sort, compare, reinterpret, or contradict Carry Index. Do not mention Carry Index scores or comparisons in prose; the client renders them from structured fields.
+match_stat_facts is the only authority for claims such as match-high, match-low, team-high, team-low, most, least, highest, lowest, first, or last. Never infer an extreme from the prose tables. If multiple player_ids share an extremum, it is a tie and must not be described as a unique extreme.
+MVP and liability must be chosen from the whole roster. Liability may use an empty player_id when no single player is decisively responsible. Never default liability to the player whose token was used to fetch the match.
 """.rstrip()
         prompt = f"""
 {persona_prompt}
@@ -923,6 +1038,9 @@ The fixed carry_index_data score is authoritative. Hero knowledge may explain vi
 
 【服务端计算的全场表现评分 carry_index_data】
 {json.dumps(carry_index_data, ensure_ascii=False)}
+
+[Server-verified global scoreboard facts: match_stat_facts]
+{json.dumps(match_stat_facts, ensure_ascii=False)}
 
 【查询方队伍属性评分 attribute_scores】
 {json.dumps(score_bundle, ensure_ascii=False)}
@@ -932,12 +1050,11 @@ The fixed carry_index_data score is authoritative. Hero knowledge may explain vi
 --------------------------------------------------
 【全员英雄详细数据】
 {detailed_text}
+{fact_policy_block}
 {knowledge_block}
 --------------------------------------------------
 【硬性输出要求】
 只输出合法 JSON，禁止 Markdown、解释、前后缀。players 必须覆盖比赛面板全部玩家且保持面板顺序；player_id 必须精确使用输入中的完整 BattleTag；rating 仅能是 S/A/B/C/D。
-Do not cite, infer, or construct historical averages, medians, percentiles, global benchmarks, or rank benchmarks. No historical reference sample is supplied to the model. Evaluate players only from the explicitly supplied match data, carry_index_data, and hero knowledge.
-如果一个玩家表现较差，对该玩家提供建议。建议必须指出本场比赛中明显的优势或劣势，且不得将知识库回顾方向作为观察到的事件呈现。建议可以是更换其他英雄以反制对方。
 {json.dumps(response_schema, ensure_ascii=False, indent=2)}
 """.strip()
 
@@ -976,7 +1093,7 @@ Do not cite, infer, or construct historical averages, medians, percentiles, glob
         all_player_details: List[Dict[str, Any]],
         target_id: str,
     ) -> Dict[str, Any]:
-        """Keep model prose, but anchor roster and scores to real match data."""
+        """Keep model prose, but anchor the global roster and facts to server data."""
         roster: List[Dict[str, str]] = []
         for team_name, players in (("teammate", match_data.get("teammateList") or []), ("enemy", match_data.get("enemyList") or [])):
             for player in players:
@@ -999,6 +1116,7 @@ Do not cite, infer, or construct historical averages, medians, percentiles, glob
         # The structured endpoint returns this list directly as JSON, so do
         # not attach the PIL icons used by the legacy report renderer.
         carry_index_data = build_carry_index_data(match_data, include_image_icons=False)
+        match_stat_facts = _build_match_stat_facts(match_data, carry_index_data)
         carry_by_id = {
             str(item.get("player_id") or "").strip().lower(): item
             for item in carry_index_data
@@ -1018,19 +1136,24 @@ Do not cite, infer, or construct historical averages, medians, percentiles, glob
                 "display_name": player_id.split("#", 1)[0],
                 "team": roster_player["team"],
                 "rating": rating,
-                "headline": str(source.get("headline") or source.get("general_summary") or "未返回有效的一句话点评。"),
-                "analysis": str(source.get("analysis") or source.get("evaluation") or "未返回该玩家的详细分析。"),
+                "headline": _sanitize_model_analysis_text(source.get("headline") or source.get("general_summary"), "未返回有效的一句话点评。"),
+                "analysis": _sanitize_model_analysis_text(source.get("analysis") or source.get("evaluation"), "未返回该玩家的详细分析。"),
                 "carry_score": int(carry.get("score") or 0),
-                "advice": str(source.get("advice") or source.get("suggestion") or source.get("recommendation") or "\u6682\u65e0\u57fa\u4e8e\u672c\u5c40\u6570\u636e\u7684\u660e\u786e\u6539\u8fdb\u5efa\u8bae\u3002"),
-                "carry_rank": 0,
+                "advice": _sanitize_model_analysis_text(source.get("advice") or source.get("suggestion") or source.get("recommendation"), "\u6682\u65e0\u57fa\u4e8e\u672c\u5c40\u6570\u636e\u7684\u660e\u786e\u6539\u8fdb\u5efa\u8bae\u3002"),
+                "carry_rank": int(carry.get("overall_rank") or 0),
+                "carry_count": int(carry.get("overall_count") or 0),
+                "team_rank": int(carry.get("team_rank") or 0),
+                "team_count": int(carry.get("team_count") or 0),
+                "role": str(carry.get("role") or ""),
+                "role_rank": carry.get("role_rank"),
+                "role_count": int(carry.get("role_count") or 0),
+                "team_role_rank": carry.get("team_role_rank"),
+                "team_role_count": int(carry.get("team_role_count") or 0),
                 "hero_guid": str(carry.get("hero_guid") or ""),
                 "hero_icon": str(carry.get("hero_icon") or ""),
                 "icon": str(detail.get("icon") or ""),
             })
         players.sort(key=lambda item: int(item["carry_score"]), reverse=True)
-        for rank, player in enumerate(players, start=1):
-            player["carry_rank"] = rank
-
         raw_match = raw.get("match") if isinstance(raw.get("match"), dict) else raw
 
         def card(value: Any, fallback_title: str) -> Dict[str, str]:
@@ -1038,20 +1161,21 @@ Do not cite, infer, or construct historical averages, medians, percentiles, glob
             return {
                 "title": str(source.get("title") or fallback_title),
                 "player_id": str(source.get("player_id") or ""),
-                "reason": str(source.get("reason") or source.get("analysis") or value or "未返回有效结论。"),
+                "reason": _sanitize_model_analysis_text(source.get("reason") or source.get("analysis") or value, "未返回有效结论。"),
             }
 
         return {
             "schema_version": "v2",
-            "target_player_id": target_id,
+            "analysis_scope": "all_players",
             "generated_at": time.strftime("%Y-%m-%d %H:%M", time.localtime()),
             "carry_index_data": carry_index_data,
+            "match_stat_facts": match_stat_facts,
             "players": players,
             "match": {
                 "win_condition": card(raw_match.get("win_condition") or raw.get("key_to_win_loss"), "唯一胜负手"),
                 "mvp": card(raw_match.get("mvp"), "MVP"),
                 "liability": card(raw_match.get("liability") or raw_match.get("scapegoat"), "背锅位"),
-                "summary": str(raw_match.get("summary") or raw.get("summary") or "未返回有效的一句话总结。"),
+                "summary": _sanitize_model_analysis_text(raw_match.get("summary") or raw.get("summary"), "未返回有效的一句话总结。"),
             },
         }
 

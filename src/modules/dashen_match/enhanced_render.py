@@ -1144,6 +1144,9 @@ def calculate_match_scores(match_data: dict[str, Any]) -> dict[str, int]:
 
 
 def generate_match_summary_text(match_data: dict[str, Any], target_player_id: str) -> str:
+    # Kept for call-site compatibility. Analysis is intentionally global and
+    # must not mark the player whose token was used to fetch the match.
+    del target_player_id
     config = _load_ow_config()
     map_info = _find_map(config, match_data.get("mapGuid"))
     map_name = map_info.get("name") or "未知地图"
@@ -1157,7 +1160,6 @@ def generate_match_summary_text(match_data: dict[str, Any], target_player_id: st
         f"地图：{map_name}（{map_mode}）",
         f"结果：{result_text}（比分：{score}）",
         f"时长：{duration}",
-        f"焦点玩家：{target_player_id}",
         "",
     ]
     header = (
@@ -1169,7 +1171,7 @@ def generate_match_summary_text(match_data: dict[str, Any], target_player_id: st
         block = [f"[{team_name}]", *header]
         for player in player_list:
             name = str(player.get("name") or "未知玩家")
-            display_name = f"* {name}" if name == target_player_id else name
+            display_name = name
             hero_info = _resolve_player_hero(config, player)
             hero_name = hero_info.get("name") or "未知英雄"
             block.append(
@@ -1201,14 +1203,14 @@ def generate_match_summary_text(match_data: dict[str, Any], target_player_id: st
 
 
 def generate_detailed_stats_text(all_player_details: Sequence[dict[str, Any]], target_player_id: str) -> str:
+    # Kept for call-site compatibility; detailed data is presented uniformly.
+    del target_player_id
     config = _load_ow_config()
     lines = ["[全员英雄详细]", "以下数据来自各玩家公开的同场对局详细。", ""]
     for player in all_player_details:
         team_tag = "[队友]" if player.get("team_type") == "teammate" else "[对手]"
         player_name = str(player.get("name") or "未知玩家")
         label = f"{team_tag} {player_name}"
-        if player_name == target_player_id:
-            label += "（焦点）"
         lines.append(label)
         hero_list = list(player.get("heroList") or [])
         if not hero_list:
@@ -1281,6 +1283,7 @@ def build_carry_index_data(
                     "player_id": str(player.get("name") or "unknown"),
                     "name": str(player.get("name") or "未知").split("#", 1)[0],
                     "team": team_label,
+                    "role": str(hero_info.get("roleType") or "").strip().lower(),
                     "score": int(round(score)),
                     "hero_guid": hero_guid,
                     "hero_icon": hero_icon_url,
@@ -1289,6 +1292,64 @@ def build_carry_index_data(
             )
 
     carry_index_data.sort(key=lambda item: int(item.get("score", 0)), reverse=True)
+
+    team_sizes: dict[str, int] = defaultdict(int)
+    role_sizes: dict[str, int] = defaultdict(int)
+    team_role_sizes: dict[tuple[str, str], int] = defaultdict(int)
+    for item in carry_index_data:
+        team = str(item.get("team") or "")
+        role = str(item.get("role") or "")
+        team_sizes[team] += 1
+        if role:
+            role_sizes[role] += 1
+            team_role_sizes[(team, role)] += 1
+
+    team_positions: dict[str, int] = defaultdict(int)
+    role_positions: dict[str, int] = defaultdict(int)
+    team_role_positions: dict[tuple[str, str], int] = defaultdict(int)
+    team_last_scores: dict[str, int] = {}
+    role_last_scores: dict[str, int] = {}
+    team_role_last_scores: dict[tuple[str, str], int] = {}
+    team_last_ranks: dict[str, int] = {}
+    role_last_ranks: dict[str, int] = {}
+    team_role_last_ranks: dict[tuple[str, str], int] = {}
+    total_players = len(carry_index_data)
+    overall_last_score: Optional[int] = None
+    overall_last_rank = 0
+    for overall_position, item in enumerate(carry_index_data, start=1):
+        team = str(item.get("team") or "")
+        role = str(item.get("role") or "")
+        score = int(item.get("score") or 0)
+        if overall_last_score != score:
+            overall_last_score = score
+            overall_last_rank = overall_position
+        team_positions[team] += 1
+        if team_last_scores.get(team) != score:
+            team_last_scores[team] = score
+            team_last_ranks[team] = team_positions[team]
+        item["overall_rank"] = overall_last_rank
+        item["overall_count"] = total_players
+        item["team_rank"] = team_last_ranks[team]
+        item["team_count"] = team_sizes[team]
+        if role:
+            team_role_key = (team, role)
+            role_positions[role] += 1
+            team_role_positions[team_role_key] += 1
+            if role_last_scores.get(role) != score:
+                role_last_scores[role] = score
+                role_last_ranks[role] = role_positions[role]
+            if team_role_last_scores.get(team_role_key) != score:
+                team_role_last_scores[team_role_key] = score
+                team_role_last_ranks[team_role_key] = team_role_positions[team_role_key]
+            item["role_rank"] = role_last_ranks[role]
+            item["role_count"] = role_sizes[role]
+            item["team_role_rank"] = team_role_last_ranks[team_role_key]
+            item["team_role_count"] = team_role_sizes[team_role_key]
+        else:
+            item["role_rank"] = None
+            item["role_count"] = 0
+            item["team_role_rank"] = None
+            item["team_role_count"] = 0
     return carry_index_data
 
 
