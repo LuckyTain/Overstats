@@ -4,11 +4,15 @@ import asyncio
 import base64
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import ipaddress
 import json
 import re
+import secrets
+import socket
 import threading
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -24,6 +28,7 @@ except ModuleNotFoundError:
     from src.modules.errors import ModuleError
 from ..analysis_common import build_async_client as build_analysis_async_client
 from ..analysis_common import get_analysis_proxy
+from ...db import analysis_cache
 
 from .enhanced_render import (
     build_carry_index_data,
@@ -59,11 +64,97 @@ PLAYER_CARD_CACHE_MAX = 512
 REPLY_CONTEXT_CACHE_TTL = 1800
 REPLY_CONTEXT_CACHE_MAX = 256
 
+ANALYSIS_RATE_LIMIT_REQUESTS = int(getattr(app_config, "ANALYSIS_RATE_LIMIT_REQUESTS", 20) or 20)
+ANALYSIS_RATE_LIMIT_WINDOW_SECONDS = int(getattr(app_config, "ANALYSIS_RATE_LIMIT_WINDOW_SECONDS", 60) or 60)
+ANALYSIS_CACHE_TTL_SECONDS = int(getattr(app_config, "ANALYSIS_CACHE_TTL_SECONDS", 86400) or 86400)
+ANALYSIS_CACHE_VERSION = str(getattr(app_config, "ANALYSIS_CACHE_VERSION", "v1") or "v1")
+ANALYSIS_CACHE_NAMESPACE = "server-default"
+BYOK_CONTEXT_TTL_SECONDS = 900
+
 _CACHE_LOCK = threading.RLock()
 _PLAYER_TOKEN_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _PLAYER_DETAIL_CACHE: "OrderedDict[tuple[str, str], dict[str, Any]]" = OrderedDict()
 _PLAYER_CARD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _REPLY_CONTEXT_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_ANALYSIS_RATE_LOCK = threading.RLock()
+_ANALYSIS_RATE_TIMES: List[float] = []
+_ANALYSIS_LOCK_GUARD = threading.RLock()
+_ANALYSIS_LOCKS: Dict[str, asyncio.Lock] = {}
+_BYOK_CONTEXTS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+
+def _analysis_cache_meta(created_at: float, expires_at: float, *, hit: bool) -> Dict[str, Any]:
+    return {
+        "scope": "server",
+        "hit": hit,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_at)),
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at)),
+        "ttl_seconds": ANALYSIS_CACHE_TTL_SECONDS,
+    }
+
+
+def _acquire_analysis_rate_slot() -> None:
+    now = time.monotonic()
+    with _ANALYSIS_RATE_LOCK:
+        cutoff = now - ANALYSIS_RATE_LIMIT_WINDOW_SECONDS
+        _ANALYSIS_RATE_TIMES[:] = [stamp for stamp in _ANALYSIS_RATE_TIMES if stamp > cutoff]
+        if len(_ANALYSIS_RATE_TIMES) >= ANALYSIS_RATE_LIMIT_REQUESTS:
+            retry_after = max(1, int(_ANALYSIS_RATE_TIMES[0] + ANALYSIS_RATE_LIMIT_WINDOW_SECONDS - now + 0.999))
+            raise ModuleError(
+                error="analysis_rate_limited",
+                message="AI 锐评请求过于频繁，请稍后重试。",
+                status_code=429,
+                details={
+                    "limit": ANALYSIS_RATE_LIMIT_REQUESTS,
+                    "window_seconds": ANALYSIS_RATE_LIMIT_WINDOW_SECONDS,
+                    "retry_after_seconds": retry_after,
+                },
+            )
+        _ANALYSIS_RATE_TIMES.append(now)
+
+
+def _analysis_lock(match_id: str) -> asyncio.Lock:
+    with _ANALYSIS_LOCK_GUARD:
+        lock = _ANALYSIS_LOCKS.get(match_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _ANALYSIS_LOCKS[match_id] = lock
+        return lock
+
+
+def _purge_byok_contexts() -> None:
+    now = time.time()
+    with _CACHE_LOCK:
+        for request_id, context in list(_BYOK_CONTEXTS.items()):
+            if float(context.get("expires_at", 0)) <= now:
+                _BYOK_CONTEXTS.pop(request_id, None)
+
+
+async def _validated_public_byok_url(endpoint: str) -> str:
+    value = str(endpoint or "").strip().rstrip("/")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ModuleError(error="invalid_byok_endpoint", message="BYOK API endpoint is invalid.", status_code=400) from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ModuleError(error="invalid_byok_endpoint", message="BYOK API endpoint must be an absolute HTTP or HTTPS URL.", status_code=400)
+    if parsed.username or parsed.password:
+        raise ModuleError(error="invalid_byok_endpoint", message="BYOK API endpoint must not contain URL credentials.", status_code=400)
+    if parsed.fragment:
+        raise ModuleError(error="invalid_byok_endpoint", message="BYOK API endpoint must not contain a URL fragment.", status_code=400)
+    try:
+        addresses = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ModuleError(error="byok_proxy_dns_failed", message="BYOK API endpoint could not be resolved.", status_code=400) from exc
+    resolved = {str(item[4][0]).split("%", 1)[0] for item in addresses if item and item[4]}
+    if not resolved or any(not ipaddress.ip_address(address).is_global for address in resolved):
+        raise ModuleError(
+            error="byok_proxy_endpoint_blocked",
+            message="BYOK proxy only allows public HTTP or HTTPS endpoints.",
+            status_code=403,
+        )
+    return value
 
 
 _CARRY_CLAIM_RE = re.compile(
@@ -309,6 +400,7 @@ class DashenMatchAnalysisOutput:
     match_id: str
     match_kind: str
     analysis: Dict[str, Any] = field(default_factory=dict)
+    cache: Dict[str, Any] = field(default_factory=dict)
 
 
 class DashenMatchModule:
@@ -570,6 +662,57 @@ class DashenMatchModule:
         customer_token: str,
         match_id: str,
     ) -> DashenMatchAnalysisOutput:
+        customer_token = str(customer_token or "").strip()
+        match_id = str(match_id or "").strip()
+        if not customer_token:
+            raise ModuleError(error="missing_customer_token", message="customer_token is required for match analysis.", status_code=400)
+        if not match_id:
+            raise ModuleError(error="missing_match_selector", message="match_id is required for match analysis.", status_code=400)
+
+        cached = analysis_cache.get(ANALYSIS_CACHE_NAMESPACE, ANALYSIS_CACHE_VERSION, match_id)
+        if cached:
+            return DashenMatchAnalysisOutput(
+                customer_token=customer_token,
+                match_id=match_id,
+                match_kind=str(cached.get("match_kind") or "normal"),
+                analysis=dict(cached["analysis"]),
+                cache=_analysis_cache_meta(float(cached["created_at"]), float(cached["expires_at"]), hit=True),
+            )
+
+        async with _analysis_lock(match_id):
+            cached = analysis_cache.get(ANALYSIS_CACHE_NAMESPACE, ANALYSIS_CACHE_VERSION, match_id)
+            if cached:
+                return DashenMatchAnalysisOutput(
+                    customer_token=customer_token,
+                    match_id=match_id,
+                    match_kind=str(cached.get("match_kind") or "normal"),
+                    analysis=dict(cached["analysis"]),
+                    cache=_analysis_cache_meta(float(cached["created_at"]), float(cached["expires_at"]), hit=True),
+                )
+            result = await self._generate_match_detail_analysis(customer_token=customer_token, match_id=match_id)
+            cache_times = analysis_cache.put(
+                ANALYSIS_CACHE_NAMESPACE,
+                ANALYSIS_CACHE_VERSION,
+                match_id,
+                result.match_kind,
+                result.analysis,
+                provider_model=str(getattr(app_config, "ANALYSIS_OPENAI_MODEL", "") or ""),
+                ttl_seconds=ANALYSIS_CACHE_TTL_SECONDS,
+            )
+            return DashenMatchAnalysisOutput(
+                customer_token=result.customer_token,
+                match_id=result.match_id,
+                match_kind=result.match_kind,
+                analysis=result.analysis,
+                cache=_analysis_cache_meta(cache_times["created_at"], cache_times["expires_at"], hit=False),
+            )
+
+    async def _generate_match_detail_analysis(
+        self,
+        *,
+        customer_token: str,
+        match_id: str,
+    ) -> DashenMatchAnalysisOutput:
         """Build full-roster AI analysis without rendering any image replies."""
         customer_token = str(customer_token or "").strip()
         match_id = str(match_id or "").strip()
@@ -647,6 +790,133 @@ class DashenMatchModule:
                 target_id=target_id,
             ),
         )
+
+    async def prepare_match_detail_analysis(self, *, customer_token: str, match_id: str) -> Dict[str, Any]:
+        customer_token = str(customer_token or "").strip()
+        match_id = str(match_id or "").strip()
+        if not customer_token:
+            raise ModuleError(error="missing_customer_token", message="customer_token is required for match analysis.", status_code=400)
+        if not match_id:
+            raise ModuleError(error="missing_match_selector", message="match_id is required for match analysis.", status_code=400)
+        detail = await self._get_match_detail_direct(customer_token, match_id)
+        if detail.match_kind == "fight":
+            raise ModuleError(error="analysis_not_supported", message="Structured AI analysis is not available for fight matches.", status_code=400)
+        match_data = _extract_match_detail_data(detail.payload)
+        try:
+            card_payload = await self._fetch_cached_player_card(customer_token)
+        except Exception:
+            card_payload = {}
+        card_data = card_payload.get("data") if isinstance(card_payload, dict) and isinstance(card_payload.get("data"), dict) else {}
+        players = list(match_data.get("teammateList") or []) + list(match_data.get("enemyList") or [])
+        primary_player = next((dict(player) for player in players if isinstance(player, dict) and str(player.get("name") or "").strip().lower() == str(card_data.get("name") or "").strip().lower()), {})
+        if not primary_player:
+            primary_player = next((dict(player) for player in players if isinstance(player, dict) and (player.get("heroList") or match_data.get("heroList"))), {})
+        query_full_id = str(primary_player.get("name") or card_data.get("name") or f"token:{customer_token[:8]}").strip()
+        player_details, target_id = await self._build_all_player_details(
+            match_data,
+            detail.match_id,
+            query_full_id=query_full_id,
+            query_bnet_id=str(primary_player.get("bnetId") or "").strip(),
+        )
+        built = await self._build_ai_analysis(match_data=match_data, all_player_details=player_details, target_id=target_id, request_only=True)
+        request_id = secrets.token_urlsafe(32)
+        expires_at = time.time() + BYOK_CONTEXT_TTL_SECONDS
+        with _CACHE_LOCK:
+            _purge_byok_contexts()
+            _BYOK_CONTEXTS[request_id] = {
+                "customer_token": customer_token,
+                "match_id": detail.match_id,
+                "match_kind": detail.match_kind,
+                "match_data": match_data,
+                "player_details": player_details,
+                "target_id": target_id,
+                "expires_at": expires_at,
+            }
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "match_id": detail.match_id,
+            "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at)),
+            "llm_request": {
+                "temperature": 0.2,
+                "messages": [{"role": "user", "content": str(built.get("prompt") or "")}],
+            },
+        }
+
+    async def finalize_match_detail_analysis(self, *, request_id: str, content: str) -> Dict[str, Any]:
+        request_id = str(request_id or "").strip()
+        with _CACHE_LOCK:
+            _purge_byok_contexts()
+            context = _BYOK_CONTEXTS.get(request_id)
+        if not context:
+            raise ModuleError(error="analysis_request_expired", message="The BYOK analysis request has expired.", status_code=410)
+        parsed = _parse_analysis_json(str(content or ""))
+        if not isinstance(parsed, dict):
+            raise ModuleError(error="invalid_analysis_json", message="The model response did not contain valid analysis JSON.", status_code=422)
+        analysis = self._normalize_match_analysis(
+            parsed,
+            match_data=context["match_data"],
+            all_player_details=context["player_details"],
+            target_id=str(context["target_id"]),
+        )
+        with _CACHE_LOCK:
+            _BYOK_CONTEXTS.pop(request_id, None)
+        return {
+            "ok": True,
+            "match_id": context["match_id"],
+            "match_kind": context["match_kind"],
+            "analysis": analysis,
+            "cache": {"scope": "browser", "hit": False, "ttl_seconds": 86400},
+        }
+
+    async def proxy_match_detail_analysis(
+        self,
+        *,
+        customer_token: str,
+        match_id: str,
+        endpoint: str,
+        model: str,
+        api_key: str,
+    ) -> Dict[str, Any]:
+        endpoint = await _validated_public_byok_url(endpoint)
+        model = str(model or "").strip()
+        api_key = _sanitize_api_key(api_key)
+        if not model:
+            raise ModuleError(error="missing_byok_model", message="BYOK model is required.", status_code=400)
+        if not api_key:
+            raise ModuleError(error="missing_byok_api_key", message="BYOK API key is required.", status_code=400)
+
+        prepared = await self.prepare_match_detail_analysis(customer_token=customer_token, match_id=match_id)
+        request_id = str(prepared.get("request_id") or "")
+        llm_request = prepared.get("llm_request") if isinstance(prepared.get("llm_request"), dict) else {}
+        messages = llm_request.get("messages") if isinstance(llm_request.get("messages"), list) else []
+        try:
+            raw = await self._call_byok_compatible(
+                self._chat_completion_url(endpoint),
+                api_key,
+                {"model": model, "temperature": 0.2, "messages": messages},
+            )
+            content = _extract_llm_message_content(raw)
+            if not content:
+                raise ModuleError(error="invalid_analysis_json", message="The BYOK model returned no analysis content.", status_code=422)
+            return await self.finalize_match_detail_analysis(request_id=request_id, content=content)
+        except ModuleError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ModuleError(error="byok_proxy_timeout", message="BYOK provider request timed out.", status_code=504) from exc
+        except httpx.HTTPStatusError as exc:
+            provider_status = int(exc.response.status_code)
+            if provider_status in {401, 403, 429}:
+                error = {401: "byok_provider_unauthorized", 403: "byok_provider_forbidden", 429: "byok_provider_rate_limited"}[provider_status]
+                message = {401: "BYOK provider rejected the API key.", 403: "BYOK provider denied this request.", 429: "BYOK provider rate limit was reached."}[provider_status]
+                raise ModuleError(error=error, message=message, status_code=provider_status, details={"provider_status": provider_status}) from exc
+            raise ModuleError(error="byok_provider_error", message="BYOK provider returned an error.", status_code=502, details={"provider_status": provider_status}) from exc
+        except (httpx.RequestError, ValueError) as exc:
+            raise ModuleError(error="byok_proxy_network_error", message="BYOK provider could not be reached or returned invalid JSON.", status_code=502) from exc
+        finally:
+            if request_id:
+                with _CACHE_LOCK:
+                    _BYOK_CONTEXTS.pop(request_id, None)
 
     async def query_match_list_by_bnet_id(
         self,
@@ -967,6 +1237,7 @@ class DashenMatchModule:
         match_data: Dict[str, Any],
         all_player_details: List[Dict[str, Any]],
         target_id: str,
+        request_only: bool = False,
     ) -> Dict[str, Any]:
         summary_text = generate_match_summary_text(match_data, target_id)
         detailed_text = generate_detailed_stats_text(all_player_details, target_id)
@@ -1059,13 +1330,20 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
 """.strip()
 
         base_url = str(getattr(app_config, "ANALYSIS_BASE_URL", "") or "").strip()
+        model = _analysis_model_for_base_url(base_url)
+        if request_only:
+            return {
+                "prompt": prompt,
+                "model": model,
+                "temperature": 0.2,
+            }
         api_key = _sanitize_api_key(getattr(app_config, "ANALYSIS_API_KEY", ""))
 
         if not base_url or not api_key:
             return {"fallback_text": "AI锐评未配置 ANALYSIS_BASE_URL / ANALYSIS_API_KEY。"}
 
-        model = _analysis_model_for_base_url(base_url)
         try:
+            _acquire_analysis_rate_slot()
             raw = await self._call_openai_compatible(
                 self._chat_completion_url(base_url),
                 api_key,
@@ -1196,6 +1474,20 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
         proxy_url = get_analysis_proxy(url)
         async with build_analysis_async_client(timeout=300, proxy_url=proxy_url) as client:
             response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+    async def _call_byok_compatible(self, url: str, api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        proxy_url = get_analysis_proxy(url)
+        async with build_analysis_async_client(timeout=300, proxy_url=proxy_url, follow_redirects=False) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            if response.is_redirect:
+                raise ModuleError(error="byok_proxy_redirect_blocked", message="BYOK proxy does not follow provider redirects.", status_code=502)
             response.raise_for_status()
             return response.json()
 

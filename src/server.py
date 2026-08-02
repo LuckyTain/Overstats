@@ -1268,6 +1268,24 @@ class OverstatsCoreService:
             lambda: self._handle_dashen_match_detail_analysis(payload),
         )
 
+    async def handle_dashen_match_detail_analysis_prepare(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "match_detail_analysis_prepare",
+            lambda: self._handle_dashen_match_detail_analysis_prepare(payload),
+        )
+
+    async def handle_dashen_match_detail_analysis_finalize(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "match_detail_analysis_finalize",
+            lambda: self._handle_dashen_match_detail_analysis_finalize(payload),
+        )
+
+    async def handle_dashen_match_detail_analysis_byok_proxy(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "match_detail_analysis_byok_proxy",
+            lambda: self._handle_dashen_match_detail_analysis_byok_proxy(payload),
+        )
+
     async def _handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
@@ -1420,7 +1438,27 @@ class OverstatsCoreService:
             "match_id": result.match_id,
             "match_kind": result.match_kind,
             "analysis": result.analysis,
+            "cache": result.cache,
         }
+
+    async def _handle_dashen_match_detail_analysis_prepare(self, payload: Dict[str, object]) -> Dict[str, object]:
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        return await dashen_match_module.prepare_match_detail_analysis(customer_token=customer_token, match_id=match_id)
+
+    async def _handle_dashen_match_detail_analysis_finalize(self, payload: Dict[str, object]) -> Dict[str, object]:
+        request_id = str(payload.get("request_id") or payload.get("requestId") or "").strip()
+        content = str(payload.get("content") or "")
+        return await dashen_match_module.finalize_match_detail_analysis(request_id=request_id, content=content)
+
+    async def _handle_dashen_match_detail_analysis_byok_proxy(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await dashen_match_module.proxy_match_detail_analysis(
+            customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+            match_id=str(payload.get("match_id") or payload.get("matchId") or "").strip(),
+            endpoint=str(payload.get("endpoint") or "").strip(),
+            model=str(payload.get("model") or "").strip(),
+            api_key=str(payload.get("api_key") or payload.get("apiKey") or ""),
+        )
 
     async def handle_dashen_match_detail_image(self, payload: Dict[str, object]) -> bytes:
         return await self.dashen_request_queue.run(
@@ -2061,6 +2099,18 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             if path == "/api/v2/dashen-match/detail/analysis":
                 self._handle_dashen_match_detail_analysis_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/analysis/prepare":
+                self._handle_dashen_match_detail_analysis_prepare_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/analysis/finalize":
+                self._handle_dashen_match_detail_analysis_finalize_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/analysis/byok-proxy":
+                self._handle_dashen_match_detail_analysis_byok_proxy_post()
                 return
 
             if path == "/api/v2/dashen-match/detail/image":
@@ -4071,6 +4121,54 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
             try:
                 result = async_runner.run(service.handle_dashen_match_detail_analysis(payload))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error. See details.", "details": {"exception": type(exc).__name__, "message": str(exc)}})
+                return
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_analysis_prepare_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": str(exc)})
+                return
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis_prepare(payload))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error. See details.", "details": {"exception": type(exc).__name__, "message": str(exc)}})
+                return
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_analysis_finalize_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": str(exc)})
+                return
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis_finalize(payload))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error. See details.", "details": {"exception": type(exc).__name__, "message": str(exc)}})
+                return
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_analysis_byok_proxy_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": str(exc)})
+                return
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis_byok_proxy(payload))
             except ModuleError as exc:
                 self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
                 return

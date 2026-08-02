@@ -891,6 +891,9 @@ The `/image` endpoint returns `image/png` in the same visual family as quick str
 - `POST /api/v2/dashen-match/detail/image`
 - `POST /api/v2/dashen-match/detail/replies`
 - `POST /api/v2/dashen-match/detail/analysis`
+- `POST /api/v2/dashen-match/detail/analysis/prepare`
+- `POST /api/v2/dashen-match/detail/analysis/finalize`
+- `POST /api/v2/dashen-match/detail/analysis/byok-proxy`
 
 详情请求方式二选一：
 
@@ -934,11 +937,50 @@ The `/image` endpoint returns `image/png` in the same visual family as quick str
       "liability": { "title": "背锅位", "player_id": "...", "reason": "..." },
       "summary": "一句话总结"
     }
+  },
+  "cache": {
+    "scope": "server",
+    "hit": false,
+    "created_at": "2026-07-26T12:34:00Z",
+    "expires_at": "2026-07-27T12:34:00Z",
+    "ttl_seconds": 86400
   }
 }
 ```
 
-Configure the full editable model instructions with `ANALYSIS_MATCH_PROMPT` in `config/config.py`. It supports `{target_id}`, `{match_summary}`, `{player_details}`, `{carry_index_data}`, and `{attribute_scores}` placeholders. `ANALYSIS_PERSONA_PROMPT` is retained as an optional prefix.
+Configure the full editable model instructions with `ANALYSIS_MATCH_PROMPT` in `config/config.py`. It supports `{target_id}`, `{match_summary}`, `{player_details}`, `{carry_index_data}`, and `{attribute_scores}` placeholders. `ANALYSIS_PERSONA_PROMPT` is retained as an optional prefix. The site model key is read from the `OVERSTATS_ANALYSIS_API_KEY` environment variable; do not commit provider keys to the repository.
+
+站点模型分析使用后端全局限流：`ANALYSIS_RATE_LIMIT_REQUESTS` 默认 20，窗口为 `ANALYSIS_RATE_LIMIT_WINDOW_SECONDS` 默认 60 秒。只有缓存未命中并真正调用站点模型时才计数，失败调用也计数；缓存命中和 BYOK 辅助接口不计数。超限返回 HTTP 429，并在 `details.retry_after_seconds` 提供建议等待秒数。
+
+成功的站点模型分析会以 `server-default` 命名空间写入 SQLite，默认由 `ANALYSIS_CACHE_TTL_SECONDS = 86400` 控制有效期，缓存键为分析版本和 `match_id`，不区分 `customer_token`。响应增加：
+
+```json
+"cache": {
+  "scope": "server",
+  "hit": true,
+  "created_at": "2026-07-26T12:34:00Z",
+  "expires_at": "2026-07-27T12:34:00Z",
+  "ttl_seconds": 86400
+}
+```
+
+BYOK 浏览器直连流程使用以下接口，Overstats 不接收 API key：
+
+- `POST /api/v2/dashen-match/detail/analysis/prepare`，请求为 `customer_token + match_id`，返回包含完整 Prompt 的临时 `request_id`，有效期 15 分钟。
+- 浏览器向用户配置的 OpenAI-compatible `/chat/completions` 端点发送请求，供应商必须允许 CORS。
+- `POST /api/v2/dashen-match/detail/analysis/finalize`，请求为 `request_id + content`，后端解析模型 JSON，并以服务端 Carry Index、头像、排名及全场事实覆盖模型可能篡改的字段。
+
+`finalize` 对过期或未知 `request_id` 返回 410，对无效模型 JSON 返回 422。BYOK 结果不会写入服务器共享缓存。客户端应将 BYOK 密钥仅存于会话存储，并提醒用户 AI 分析仅供娱乐。
+
+BYOK 默认可使用后端中转：
+
+```text
+POST /api/v2/dashen-match/detail/analysis/byok-proxy
+```
+
+请求字段为 `customer_token`、`match_id`、`endpoint`、`model` 和 `api_key`。后端在单次请求内构建 Prompt、调用用户模型并完成响应归一化；API key 不写入日志、缓存、数据库、临时上下文或响应。该调用不占站点模型 20 RPM 配额，也不写服务器共享分析缓存。
+
+中转端点允许公网 HTTP/HTTPS，禁止 URL 凭据、localhost、环回地址、内网、链路本地、保留地址、组播地址和自动重定向。公网 HTTP 可以使用，但后端到模型供应商的密钥和请求内容不会被加密。上游 401、403、429 使用独立 BYOK 错误码返回；网络失败返回 502，超时返回 504，无效模型 JSON 返回 422。
 
 **`/api/v2/dashen-match/detail` 返回结构：**
 
