@@ -32,9 +32,10 @@ DASHEN_USER_AGENT = (
 )
 DASHEN_ACCOUNT_FAILURE_COOLDOWN_SECONDS = 60
 DASHEN_MAX_CONCURRENT_REQUESTS = 2
-# Main v2 Dashen endpoints accept at most account-pool-size * 4 requests
-# (active + queued) by default. Extra requests receive HTTP 429.
-DASHEN_MAX_ACCEPTED_REQUESTS = max(len(DASHEN_ACCOUNTS) * 4, 1)
+# Active plus queued requests are admitted before returning HTTP 429.
+DASHEN_MAX_ACCEPTED_REQUESTS = max(len(DASHEN_ACCOUNTS) * 16, 64)
+DASHEN_QUEUE_WAIT_TIMEOUT_SECONDS = 75
+DASHEN_HTTP_REQUEST_QUEUE_SIZE = 128
 
 # Optional proxy settings.
 DASHEN_INTERNATIONAL_PROXY = ""

@@ -68,7 +68,9 @@ class APIConfig:
     use_stream_response: bool
     enable_database_write: bool
     dashen_max_concurrent_requests: int
-    dashen_max_accepted_requests: int = 4
+    dashen_max_accepted_requests: int = 64
+    dashen_queue_wait_timeout_seconds: float = 75.0
+    http_request_queue_size: int = 128
 
 
 @dataclass(frozen=True)
@@ -135,8 +137,8 @@ def _normalize_accounts() -> Tuple[DashenCredentialConfig, ...]:
 def _default_dashen_max_accepted_requests() -> int:
     raw_accounts = getattr(config, "DASHEN_ACCOUNTS", [])
     if not isinstance(raw_accounts, (list, tuple)):
-        return 4
-    return max(1, len(raw_accounts) * 4)
+        return 64
+    return max(64, len(raw_accounts) * 16)
 
 
 def is_database_write_enabled() -> bool:
@@ -168,6 +170,20 @@ def get_api_config() -> APIConfig:
                     "DASHEN_MAX_ACCEPTED_REQUESTS",
                     _default_dashen_max_accepted_requests(),
                 ),
+            ),
+        ),
+        dashen_queue_wait_timeout_seconds=max(
+            1.0,
+            float(os.getenv(
+                "OVERSTATS_DASHEN_QUEUE_WAIT_TIMEOUT_SECONDS",
+                str(getattr(config, "DASHEN_QUEUE_WAIT_TIMEOUT_SECONDS", 75)),
+            )),
+        ),
+        http_request_queue_size=max(
+            16,
+            _read_int_env(
+                "OVERSTATS_HTTP_REQUEST_QUEUE_SIZE",
+                getattr(config, "DASHEN_HTTP_REQUEST_QUEUE_SIZE", 128),
             ),
         ),
     )

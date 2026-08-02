@@ -5,6 +5,8 @@ import base64
 from collections.abc import Awaitable, Callable
 import locale
 import threading
+import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -282,10 +284,11 @@ _T = TypeVar("_T")
 
 
 class DashenRequestQueue:
-    def __init__(self, max_concurrent_requests: int, max_accepted_requests: Optional[int] = None) -> None:
+    def __init__(self, max_concurrent_requests: int, max_accepted_requests: Optional[int] = None, queue_wait_timeout_seconds: float = 75.0) -> None:
         self.max_concurrent_requests = max(1, int(max_concurrent_requests or 1))
         accepted_limit = self.max_concurrent_requests if max_accepted_requests is None else int(max_accepted_requests)
         self.max_accepted_requests = max(1, accepted_limit)
+        self.queue_wait_timeout_seconds = max(1.0, float(queue_wait_timeout_seconds or 1.0))
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._active_requests = 0
         self._queued_requests = 0
@@ -297,6 +300,16 @@ class DashenRequestQueue:
 
     def _pending_requests(self) -> int:
         return self._active_requests + self._queued_requests
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "active_requests": self._active_requests,
+            "queued_requests": self._queued_requests,
+            "pending_requests": self._pending_requests(),
+            "max_concurrent_requests": self.max_concurrent_requests,
+            "max_accepted_requests": self.max_accepted_requests,
+            "queue_wait_timeout_seconds": self.queue_wait_timeout_seconds,
+        }
 
     async def run(self, label: str, factory: Callable[[], Awaitable[_T]]) -> _T:
         pending_requests = self._pending_requests()
@@ -316,13 +329,29 @@ class DashenRequestQueue:
                     "queued_requests": self._queued_requests,
                     "pending_requests": pending_requests,
                     "max_accepted_requests": self.max_accepted_requests,
+                    "retry_after_seconds": 2,
                 },
             )
 
         semaphore = self._get_semaphore()
         self._queued_requests += 1
+        wait_started = time.monotonic()
         try:
-            await semaphore.acquire()
+            await asyncio.wait_for(semaphore.acquire(), timeout=self.queue_wait_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise ModuleError(
+                error="upstream_queue_timeout",
+                message="The upstream request queue timed out. Please retry later.",
+                status_code=503,
+                details={
+                    "label": label,
+                    "active_requests": self._active_requests,
+                    "queued_requests": self._queued_requests,
+                    "pending_requests": self._pending_requests(),
+                    "queue_wait_ms": int((time.monotonic() - wait_started) * 1000),
+                    "retry_after_seconds": 2,
+                },
+            ) from exc
         finally:
             self._queued_requests -= 1
 
@@ -346,10 +375,12 @@ class OverstatsCoreService:
         self,
         dashen_max_concurrent_requests: int = 2,
         dashen_max_accepted_requests: Optional[int] = None,
+        dashen_queue_wait_timeout_seconds: float = 75.0,
     ) -> None:
         self.dashen_request_queue = DashenRequestQueue(
             dashen_max_concurrent_requests,
             max_accepted_requests=dashen_max_accepted_requests,
+            queue_wait_timeout_seconds=dashen_queue_wait_timeout_seconds,
         )
 
     async def handle_dashen_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -1263,28 +1294,16 @@ class OverstatsCoreService:
         )
 
     async def handle_dashen_match_detail_analysis(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "match_detail_analysis",
-            lambda: self._handle_dashen_match_detail_analysis(payload),
-        )
+        return await self._handle_dashen_match_detail_analysis(payload)
 
     async def handle_dashen_match_detail_analysis_prepare(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "match_detail_analysis_prepare",
-            lambda: self._handle_dashen_match_detail_analysis_prepare(payload),
-        )
+        return await self._handle_dashen_match_detail_analysis_prepare(payload)
 
     async def handle_dashen_match_detail_analysis_finalize(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "match_detail_analysis_finalize",
-            lambda: self._handle_dashen_match_detail_analysis_finalize(payload),
-        )
+        return await self._handle_dashen_match_detail_analysis_finalize(payload)
 
     async def handle_dashen_match_detail_analysis_byok_proxy(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "match_detail_analysis_byok_proxy",
-            lambda: self._handle_dashen_match_detail_analysis_byok_proxy(payload),
-        )
+        return await self._handle_dashen_match_detail_analysis_byok_proxy(payload)
 
     async def _handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -1875,11 +1894,13 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     service = OverstatsCoreService(
         dashen_max_concurrent_requests=config.dashen_max_concurrent_requests,
         dashen_max_accepted_requests=config.dashen_max_accepted_requests,
+        dashen_queue_wait_timeout_seconds=config.dashen_queue_wait_timeout_seconds,
     )
     print(
         "[overstats] dashen request queue enabled "
         f"max_concurrent={config.dashen_max_concurrent_requests} "
-        f"max_accepted={config.dashen_max_accepted_requests}"
+        f"max_accepted={config.dashen_max_accepted_requests} "
+        f"queue_timeout={config.dashen_queue_wait_timeout_seconds}s"
     )
     print(f"[overstats] database writes enabled={config.enable_database_write}")
     async_runner = AsyncRunner()
@@ -1901,15 +1922,25 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     dashen_api_client.player_identity_recorder = player_identity_recorder
     dashen_api_client.request_metrics_recorder = request_metrics_recorder
 
+    class OverstatsHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+        request_queue_size = config.http_request_queue_size
+
     class OverstatsRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "OverstatsCore/0.1"
+
+        def _begin_request(self) -> None:
+            self._request_id = self.headers.get("X-Request-ID") or uuid.uuid4().hex
+            self._request_started_at = time.monotonic()
 
         def _request_path(self) -> str:
             normalized = normalize_request_metric_url(self.path)
             return normalized.rstrip("/") or "/"
 
         def do_GET(self) -> None:
+            self._begin_request()
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
             if path == "/healthz":
@@ -1921,6 +1952,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                         "default_stream": config.use_stream_response,
                         "dashen_max_concurrent_requests": config.dashen_max_concurrent_requests,
                         "dashen_max_accepted_requests": config.dashen_max_accepted_requests,
+                        "dashen_queue": service.dashen_request_queue.snapshot(),
                     },
                 )
                 return
@@ -1939,6 +1971,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             )
 
         def do_POST(self) -> None:
+            self._begin_request()
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
             if path == "/api/v2/auto-route":
@@ -4436,18 +4469,33 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Request-ID", getattr(self, "_request_id", uuid.uuid4().hex))
+            details = payload.get("details")
+            retry_after = details.get("retry_after_seconds") if isinstance(details, dict) else None
+            if retry_after:
+                self.send_header("Retry-After", str(max(1, int(float(retry_after)))))
             self.end_headers()
-            self.wfile.write(body)
-            self.wfile.flush()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                print(f"[overstats] response write failed request_id={getattr(self, '_request_id', '')} error={type(exc).__name__}")
             self._record_json_metric(status, payload)
+            started_at = getattr(self, "_request_started_at", None)
+            if started_at is not None:
+                print(f"[overstats] request complete request_id={getattr(self, '_request_id', '')} status={int(status)} elapsed_ms={int((time.monotonic() - started_at) * 1000)}")
 
         def _send_binary(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Request-ID", getattr(self, "_request_id", uuid.uuid4().hex))
             self.end_headers()
-            self.wfile.write(body)
-            self.wfile.flush()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                print(f"[overstats] response write failed request_id={getattr(self, '_request_id', '')} error={type(exc).__name__}")
             self._record_binary_metric(status)
 
         def _send_stream(
@@ -4477,7 +4525,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.wfile.write(b"\r\n")
             self.wfile.flush()
 
-    server = ThreadingHTTPServer((config.host, config.port), OverstatsRequestHandler)
+    server = OverstatsHTTPServer((config.host, config.port), OverstatsRequestHandler)
     original_server_close = server.server_close
 
     def server_close() -> None:
