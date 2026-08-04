@@ -19,9 +19,14 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
 
 RESOURCE_DIR = resolve_resource_dir()
-ASSET_MANIFEST_PATH = RESOURCE_DIR / "query_tool_assets" / "assets_manifest.json"
+ASSET_MANIFEST_PATH = runtime_path("query_tool_assets", "assets_manifest.json")
 _ASSET_MANIFEST_CACHE: Dict[str, Any] | None = None
 ROLE_ICON_FILENAMES = {
     "tank": "tank.png",
@@ -1140,7 +1145,7 @@ def _manifest_entry_path(entry: Any, categories: Sequence[str]) -> Path | None:
         folder_name = Path(relative_path).parts[0].lower() if Path(relative_path).parts else ""
         if folder_name not in {str(item).lower() for item in categories}:
             return None
-    path = RESOURCE_DIR / "query_tool_assets" / Path(relative_path)
+    path = runtime_path("query_tool_assets") / Path(relative_path)
     return path if path.exists() else None
 
 

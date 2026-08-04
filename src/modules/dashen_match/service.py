@@ -6,6 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import ipaddress
 import json
+import os
 import re
 import secrets
 import socket
@@ -70,6 +71,9 @@ ANALYSIS_CACHE_TTL_SECONDS = int(getattr(app_config, "ANALYSIS_CACHE_TTL_SECONDS
 ANALYSIS_CACHE_VERSION = str(getattr(app_config, "ANALYSIS_CACHE_VERSION", "v1") or "v1")
 ANALYSIS_CACHE_NAMESPACE = "server-default"
 BYOK_CONTEXT_TTL_SECONDS = 900
+ANALYSIS_JOB_MAX_CONCURRENT = max(1, int(os.getenv("OVERSTATS_ANALYSIS_JOB_MAX_CONCURRENT", str(getattr(app_config, "ANALYSIS_JOB_MAX_CONCURRENT", 2))) or 2))
+ANALYSIS_JOB_MAX_QUEUED = max(1, int(os.getenv("OVERSTATS_ANALYSIS_JOB_MAX_QUEUED", str(getattr(app_config, "ANALYSIS_JOB_MAX_QUEUED", 20))) or 20))
+ANALYSIS_JOB_TTL_SECONDS = max(300, int(os.getenv("OVERSTATS_ANALYSIS_JOB_TTL_SECONDS", str(getattr(app_config, "ANALYSIS_JOB_TTL_SECONDS", 3600))) or 3600))
 
 _CACHE_LOCK = threading.RLock()
 _PLAYER_TOKEN_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
@@ -81,6 +85,120 @@ _ANALYSIS_RATE_TIMES: List[float] = []
 _ANALYSIS_LOCK_GUARD = threading.RLock()
 _ANALYSIS_LOCKS: Dict[str, asyncio.Lock] = {}
 _BYOK_CONTEXTS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+_ANALYSIS_JOB_LOCK = asyncio.Lock()
+_ANALYSIS_JOB_SEMAPHORE_INSTANCE: Optional[asyncio.Semaphore] = None
+_ANALYSIS_JOBS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_ANALYSIS_JOB_KEYS: Dict[str, str] = {}
+_ANALYSIS_JOB_TASKS: Dict[str, asyncio.Task[Any]] = {}
+
+
+def _analysis_job_error(exc: Exception) -> Dict[str, Any]:
+    if isinstance(exc, ModuleError):
+        return {"code": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details}
+    return {"code": "analysis_failed", "message": "AI analysis failed. Please retry later."}
+
+
+def _analysis_job_public(job: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        "ok": True,
+        "status": str(job.get("status") or "failed"),
+        "job_id": str(job.get("job_id") or ""),
+        "match_id": str(job.get("match_id") or ""),
+        "poll_after_ms": 2000,
+    }
+    if job.get("status") == "completed":
+        result["result"] = job.get("result")
+    elif job.get("status") == "failed":
+        error = job.get("error") if isinstance(job.get("error"), dict) else {}
+        result.update({
+            "error": str(error.get("code") or "analysis_failed"),
+            "message": str(error.get("message") or "AI analysis failed. Please retry later."),
+            "hint": error.get("hint"),
+            "details": error.get("details") if isinstance(error.get("details"), dict) else {},
+        })
+    return result
+
+
+async def _analysis_job_semaphore() -> asyncio.Semaphore:
+    global _ANALYSIS_JOB_SEMAPHORE_INSTANCE
+    if _ANALYSIS_JOB_SEMAPHORE_INSTANCE is None:
+        _ANALYSIS_JOB_SEMAPHORE_INSTANCE = asyncio.Semaphore(ANALYSIS_JOB_MAX_CONCURRENT)
+    return _ANALYSIS_JOB_SEMAPHORE_INSTANCE
+
+
+async def _run_analysis_job(job_id: str, producer: Any) -> None:
+    job = _ANALYSIS_JOBS.get(job_id)
+    if not job:
+        return
+    try:
+        semaphore = await _analysis_job_semaphore()
+        async with semaphore:
+            job["status"] = "running"
+            job["updated_at"] = time.time()
+            result = await producer()
+        job["status"] = "completed"
+        job["result"] = result
+        job["updated_at"] = time.time()
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = _analysis_job_error(exc)
+        job["updated_at"] = time.time()
+
+
+async def _submit_analysis_job(*, key: str, match_id: str, producer: Any) -> Dict[str, Any]:
+    now = time.time()
+    async with _ANALYSIS_JOB_LOCK:
+        for job_id, job in list(_ANALYSIS_JOBS.items()):
+            if float(job.get("expires_at", 0)) <= now:
+                _ANALYSIS_JOBS.pop(job_id, None)
+                if _ANALYSIS_JOB_KEYS.get(str(job.get("key") or "")) == job_id:
+                    _ANALYSIS_JOB_KEYS.pop(str(job.get("key") or ""), None)
+        if len(_ANALYSIS_JOBS) >= 250:
+            for job_id, job in list(_ANALYSIS_JOBS.items()):
+                if job.get("status") in {"completed", "failed"}:
+                    _ANALYSIS_JOBS.pop(job_id, None)
+                    if _ANALYSIS_JOB_KEYS.get(str(job.get("key") or "")) == job_id:
+                        _ANALYSIS_JOB_KEYS.pop(str(job.get("key") or ""), None)
+                    if len(_ANALYSIS_JOBS) < 250:
+                        break
+        existing_id = _ANALYSIS_JOB_KEYS.get(key)
+        existing = _ANALYSIS_JOBS.get(existing_id or "")
+        if existing and existing.get("status") in {"queued", "running", "completed"}:
+            return _analysis_job_public(existing)
+        active_count = sum(1 for item in _ANALYSIS_JOBS.values() if item.get("status") in {"queued", "running"})
+        if active_count >= ANALYSIS_JOB_MAX_QUEUED + ANALYSIS_JOB_MAX_CONCURRENT:
+            raise ModuleError(
+                error="analysis_job_queue_full",
+                message="AI analysis queue is full. Please retry later.",
+                status_code=429,
+                details={"retry_after_seconds": 10, "queue_limit": ANALYSIS_JOB_MAX_QUEUED},
+            )
+        job_id = secrets.token_urlsafe(24)
+        job = {
+            "job_id": job_id,
+            "key": key,
+            "match_id": match_id,
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "expires_at": now + ANALYSIS_JOB_TTL_SECONDS,
+        }
+        _ANALYSIS_JOBS[job_id] = job
+        _ANALYSIS_JOB_KEYS[key] = job_id
+        task = asyncio.create_task(_run_analysis_job(job_id, producer))
+        _ANALYSIS_JOB_TASKS[job_id] = task
+        task.add_done_callback(lambda _, completed_id=job_id: _ANALYSIS_JOB_TASKS.pop(completed_id, None))
+        return _analysis_job_public(job)
+
+
+async def get_analysis_job(job_id: str) -> Dict[str, Any]:
+    now = time.time()
+    async with _ANALYSIS_JOB_LOCK:
+        job = _ANALYSIS_JOBS.get(str(job_id or "").strip())
+        if not job or float(job.get("expires_at", 0)) <= now:
+            raise ModuleError(error="analysis_job_not_found", message="AI analysis job was not found or has expired.", status_code=404)
+        return _analysis_job_public(job)
 
 
 def _analysis_cache_meta(created_at: float, expires_at: float, *, hit: bool) -> Dict[str, Any]:
@@ -706,6 +824,68 @@ class DashenMatchModule:
                 analysis=result.analysis,
                 cache=_analysis_cache_meta(cache_times["created_at"], cache_times["expires_at"], hit=False),
             )
+
+    async def create_match_detail_analysis_job(self, *, customer_token: str, match_id: str) -> Dict[str, Any]:
+        customer_token = str(customer_token or "").strip()
+        match_id = str(match_id or "").strip()
+        if not customer_token:
+            raise ModuleError(error="missing_customer_token", message="customer_token is required for match analysis.", status_code=400)
+        if not match_id:
+            raise ModuleError(error="missing_match_selector", message="match_id is required for match analysis.", status_code=400)
+
+        async def produce() -> Dict[str, Any]:
+            result = await self.query_match_detail_analysis(customer_token=customer_token, match_id=match_id)
+            return {
+                "ok": True,
+                "customer_token": result.customer_token,
+                "match_id": result.match_id,
+                "match_kind": result.match_kind,
+                "analysis": result.analysis,
+                "cache": result.cache,
+            }
+
+        return await _submit_analysis_job(key=f"server:{match_id}", match_id=match_id, producer=produce)
+
+    async def create_byok_proxy_analysis_job(
+        self,
+        *,
+        customer_token: str,
+        match_id: str,
+        endpoint: str,
+        model: str,
+        api_key: str,
+    ) -> Dict[str, Any]:
+        customer_token = str(customer_token or "").strip()
+        match_id = str(match_id or "").strip()
+        endpoint = str(endpoint or "").strip()
+        model = str(model or "").strip()
+        api_key = _sanitize_api_key(api_key)
+        if not customer_token:
+            raise ModuleError(error="missing_customer_token", message="customer_token is required for match analysis.", status_code=400)
+        if not match_id:
+            raise ModuleError(error="missing_match_selector", message="match_id is required for match analysis.", status_code=400)
+        if not model:
+            raise ModuleError(error="missing_byok_model", message="BYOK model is required.", status_code=400)
+        if not api_key:
+            raise ModuleError(error="missing_byok_api_key", message="BYOK API key is required.", status_code=400)
+        endpoint = await _validated_public_byok_url(endpoint)
+
+        import hashlib
+        fingerprint = hashlib.sha256(f"{endpoint}\n{model}\n{api_key}".encode("utf-8")).hexdigest()
+
+        async def produce() -> Dict[str, Any]:
+            return await self.proxy_match_detail_analysis(
+                customer_token=customer_token,
+                match_id=match_id,
+                endpoint=endpoint,
+                model=model,
+                api_key=api_key,
+            )
+
+        return await _submit_analysis_job(key=f"byok:{match_id}:{fingerprint}", match_id=match_id, producer=produce)
+
+    async def get_analysis_job(self, job_id: str) -> Dict[str, Any]:
+        return await get_analysis_job(job_id)
 
     async def _generate_match_detail_analysis(
         self,
@@ -1360,6 +1540,10 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
                     "footer_source": "AI锐评",
                 }
             return {"fallback_text": f"AI锐评生成失败。错误：invalid json ({model})"}
+        except ModuleError:
+            # Preserve typed service errors such as the 20 RPM limit so the
+            # HTTP layer can return the documented status and Retry-After.
+            raise
         except Exception as exc:
             return {"fallback_text": f"AI锐评生成失败。错误：{type(exc).__name__}: {exc}"}
 

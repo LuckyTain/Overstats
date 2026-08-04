@@ -19,12 +19,17 @@ try:
 except ModuleNotFoundError:
     from src.modules.season_config import normalize_query_tool_config
 
+try:
+    from overstats.src.runtime_paths import resource_path, runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import resource_path, runtime_path
+
 from .requests import MANUAL_KEYS, REMOTE_HEADERS, QueryToolRequests
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-QUERY_TOOL_PATH = PROJECT_ROOT / "overstats" / "res" / "query_tool.json"
-QUERY_TOOL_ASSET_DIR = PROJECT_ROOT / "overstats" / "res" / "query_tool_assets"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+QUERY_TOOL_PATH = resource_path("query_tool.json")
+QUERY_TOOL_ASSET_DIR = runtime_path("query_tool_assets")
 QUERY_TOOL_ASSET_MANIFEST_PATH = QUERY_TOOL_ASSET_DIR / "assets_manifest.json"
 IMAGE_URL_KEYS = ("icon", "image", "avatar", "portrait", "background", "smallIconUrl", "ddHeroIcon")
 ASSET_SECTION_DIRS = {

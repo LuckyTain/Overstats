@@ -17,12 +17,17 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
 from .engine import HeroBillboardEntry, HeroUsageRow, ProfileRenderContext, RolePanelEntry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 RESOURCE_DIR = resolve_resource_dir()
-QUERY_TOOL_ASSET_DIR = RESOURCE_DIR / "query_tool_assets"
+QUERY_TOOL_ASSET_DIR = runtime_path("query_tool_assets")
 ROLE_ICON_FILENAMES = {
     "tank": "tank.png",
     "dps": "dps.png",

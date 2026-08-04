@@ -70,7 +70,7 @@ DASHEN_ACCOUNTS = [
     },
 ]
 
-DASHEN_MAX_ACCEPTED_REQUESTS = max(len(DASHEN_ACCOUNTS) * 4, 1)
+DASHEN_MAX_ACCEPTED_REQUESTS = max(len(DASHEN_ACCOUNTS) * 16, 64)
 ```
 
 说明：
@@ -123,6 +123,10 @@ curl http://127.0.0.1:18080/healthz
 - `POST /api/v2/dashen-match/detail`
 - `POST /api/v2/dashen-match/detail/image`
 - `POST /api/v2/dashen-match/detail/replies`
+- `POST /api/v2/dashen-match/detail/analysis/jobs`
+- `GET /api/v2/dashen-match/detail/analysis/jobs/{job_id}`
+- `POST /api/v2/dashen-match/detail/analysis/byok-proxy/jobs`
+
 - `POST /api/v2/dashen-sameplay`
 - `POST /api/v2/dashen-sameplay/image`
 - `POST /api/v2/dashen-sameplay/replies`
@@ -155,6 +159,12 @@ curl http://127.0.0.1:18080/healthz
 - `POST /api/v2/auto-route`
 - `POST /api/v2/patch-notes`
 - `POST /api/v2/patch-notes/image`
+
+## VPS deployment
+
+The `deploy/` directory contains Ubuntu systemd, Nginx, and environment templates. Set `OVERSTATS_DASHEN_ACCOUNTS_JSON` in the protected environment file instead of putting credentials in `config.py`. Set `OVERSTATS_DATA_DIR` to a persistent directory such as `/var/lib/athena-ai`, and set `OVERSTATS_ALLOWED_ORIGINS` to the production Cloudflare Pages origin. Copy `cloudflare-real-ip.conf.example` to the Nginx snippets directory, keep its Cloudflare CIDR list current, and configure the API hostname plus Origin CA certificate paths in `nginx-athena-api.conf`.
+
+Use Cloudflare orange-cloud proxying for the API hostname, a Cloudflare Origin CA certificate in Nginx, and firewall rules that allow only Cloudflare IP ranges on ports 80 and 443. Keep Python on `127.0.0.1:18080`; the web AI entry points use asynchronous analysis jobs so Cloudflare does not have to hold a long-running request.
 
 更细的请求与响应格式后续可以单独整理成 API 文档。当前以 `overstats/src/server.py` 中实际暴露的路由为准。
 

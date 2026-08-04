@@ -891,6 +891,9 @@ The `/image` endpoint returns `image/png` in the same visual family as quick str
 - `POST /api/v2/dashen-match/detail/image`
 - `POST /api/v2/dashen-match/detail/replies`
 - `POST /api/v2/dashen-match/detail/analysis`
+- `POST /api/v2/dashen-match/detail/analysis/jobs`
+- `GET /api/v2/dashen-match/detail/analysis/jobs/{job_id}`
+- `POST /api/v2/dashen-match/detail/analysis/byok-proxy/jobs`
 - `POST /api/v2/dashen-match/detail/analysis/prepare`
 - `POST /api/v2/dashen-match/detail/analysis/finalize`
 - `POST /api/v2/dashen-match/detail/analysis/byok-proxy`
@@ -906,6 +909,19 @@ The `/image` endpoint returns `image/png` in the same visual family as quick str
 - `analyze: bool`
 
 **`POST /api/v2/dashen-match/detail/analysis`** only accepts `customer_token + match_id` and returns JSON AI analysis without rendering images:
+
+For web clients, prefer the asynchronous job endpoint. The create response is
+`202 Accepted` with `status` (`queued`, `running`, or `completed`) and `job_id`;
+poll `GET /api/v2/dashen-match/detail/analysis/jobs/{job_id}` until it returns
+`status: "completed"` and a `result`, or `status: "failed"` with a typed error.
+When the failed error is `analysis_rate_limited`, the polling response is HTTP
+`429` and includes `Retry-After` plus `details.retry_after_seconds`.
+The site-model job is deduplicated by `match_id`, limited to two concurrent
+jobs and twenty queued jobs, and avoids keeping a Cloudflare request open while
+the LLM is running. `POST /api/v2/dashen-match/detail/analysis/byok-proxy/jobs`
+uses the same polling contract for BYOK backend-proxy requests; its request
+body includes `endpoint`, `model`, and `api_key`, but the key is never included
+in job status, logs, cache, or the response payload.
 
 ```json
 {

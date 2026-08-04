@@ -21,6 +21,7 @@ __pycache__/
 Thumbs.db
 
 # Runtime caches
+cache/
 res/cache_img/
 res/query_tool_assets/
 src/modules/dashen_summary/runtime/cache/

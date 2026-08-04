@@ -8,9 +8,12 @@ import re
 import tempfile
 from typing import Any, Mapping
 
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-OW_HERO_WIKI_CACHE_DIR = PROJECT_ROOT / "cache" / "ow_hero_wiki"
+OW_HERO_WIKI_CACHE_DIR = runtime_path("cache", "ow_hero_wiki")
 PAGE_CACHE_DIR = OW_HERO_WIKI_CACHE_DIR / "pages"
 STRUCTURED_CACHE_DIR = OW_HERO_WIKI_CACHE_DIR / "structured"
 ANSWER_CACHE_DIR = OW_HERO_WIKI_CACHE_DIR / "answers"

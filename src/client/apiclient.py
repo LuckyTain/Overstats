@@ -98,7 +98,13 @@ BLIZZARD_HOST = "https://overwatch.blizzard.com"
 DEFAULT_BLIZZARD_LOCALE = "zh-tw"
 OVERFAST_PLAYERS_URL = "https://overfast-api.tekrop.fr/players"
 PANDASCORE_OW_MATCHES_URL = "https://api.pandascore.co/ow/matches"
-REMOTE_IMAGE_CACHE_DIR = Path(__file__).resolve().parents[2] / "res" / "cache_img"
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
+
+REMOTE_IMAGE_CACHE_DIR = runtime_path("cache_img")
 
 
 def _build_ow_esports_headers(api_key: Optional[str]) -> Dict[str, str]:

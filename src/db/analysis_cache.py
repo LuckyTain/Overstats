@@ -8,11 +8,18 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-ANALYSIS_CACHE_DB_PATH = Path(__file__).resolve().parent / "analysis_cache.sqlite3"
+try:
+    from overstats.src.runtime_paths import ensure_parent, runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import ensure_parent, runtime_path
+
+
+ANALYSIS_CACHE_DB_PATH = runtime_path("db", "analysis_cache.sqlite3")
 _LOCK = threading.RLock()
 
 
 def _connect() -> sqlite3.Connection:
+    ensure_parent(ANALYSIS_CACHE_DB_PATH)
     connection = sqlite3.connect(str(ANALYSIS_CACHE_DB_PATH), timeout=30)
     connection.row_factory = sqlite3.Row
     return connection

@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-MATCH_STATS_DB_PATH = Path(__file__).resolve().parent / "match_stats.sqlite3"
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
+
+MATCH_STATS_DB_PATH = runtime_path("db", "match_stats.sqlite3")
 PLAYER_IDENTITY_TABLE = "player_identity_map"
 HERO_MATCH_DETAIL_TABLE = "hero_match_detail"
 COMP_DATA_TABLE = "comp_data"
@@ -43,6 +49,7 @@ class IDPoolDB:
         print(f"[overstats] {message}")
 
     def _get_connection(self) -> Optional[sqlite3.Connection]:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.db_path.exists():
             self._warn_once(f"match stats sqlite db not found: {self.db_path}")
             return None

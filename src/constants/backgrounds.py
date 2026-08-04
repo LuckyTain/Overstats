@@ -7,7 +7,13 @@ from typing import Any, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESOURCE_DIR = PROJECT_ROOT / "res"
-QUERY_TOOL_MAPS_DIR = RESOURCE_DIR / "query_tool_assets" / "maps"
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
+
+QUERY_TOOL_MAPS_DIR = runtime_path("query_tool_assets", "maps")
 BACKGROUND_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 
 

@@ -37,6 +37,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
 
+try:
+    from overstats.src.runtime_paths import runtime_path, resource_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path, resource_path
+
 
 def _read_env_int(name, default):
     raw_value = str(os.getenv(name, "") or "").strip()
@@ -50,11 +55,11 @@ def _read_env_int(name, default):
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-RESOURCE_DIR = PROJECT_ROOT / "res"
-QUERY_TOOL_ASSET_DIR = RESOURCE_DIR / "query_tool_assets"
+RESOURCE_DIR = resource_path()
+QUERY_TOOL_ASSET_DIR = runtime_path("query_tool_assets")
 SUMMARY_EXTRA_ASSET_DIR = QUERY_TOOL_ASSET_DIR / "extra"
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "res", "query_tool.json")
-RANK_DISTRIBUTION_CACHE_DIR = os.path.join(MODULE_DIR, "cache", "rank_distribution_daily")
+CONFIG_PATH = str(resource_path("query_tool.json"))
+RANK_DISTRIBUTION_CACHE_DIR = str(runtime_path("cache", "rank_distribution_daily"))
 SEASON_SUMMARY_URL_LIMIT = 6
 SEASON_SUMMARY_RENDER_CONCURRENCY = get_global_render_limit()
 SEASON_SUMMARY_RENDER_LOG_WAIT_MS = 200

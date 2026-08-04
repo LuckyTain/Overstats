@@ -14,7 +14,13 @@ except ModuleNotFoundError:
     from config import is_database_write_enabled
 
 
-REQUEST_METRICS_DB_PATH = Path(__file__).resolve().parent / "request_metrics.sqlite3"
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
+
+REQUEST_METRICS_DB_PATH = runtime_path("db", "request_metrics.sqlite3")
 REQUEST_METRICS_TABLE = "request_url_stats"
 REQUEST_SOURCE_MODULE = "module"
 REQUEST_SOURCE_UPSTREAM = "upstream"

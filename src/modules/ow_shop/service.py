@@ -18,9 +18,13 @@ except ModuleNotFoundError:
 from .render import MAX_RENDER_BYTES, RenderedImage, render_ow_shop
 from .requests import OWShopRequests, OWShopSection, SHOP_SECTION_SOURCES
 
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CACHE_ROOT = PROJECT_ROOT / "cache" / "ow_shop"
+
+DEFAULT_CACHE_ROOT = runtime_path("cache", "ow_shop")
 CACHE_TTL_SECONDS = 15 * 60
 OW_SHOP_UNAVAILABLE_MESSAGE = "OW 商店数据暂时不可用。"
 

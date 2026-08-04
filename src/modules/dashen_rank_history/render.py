@@ -20,6 +20,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
 from .requests import fight_payload_has_content, payload_data, sport_payload_has_content
 
 
@@ -27,7 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 RESOURCE_DIR = resolve_resource_dir()
 SEASON_LOGO_DIR = RESOURCE_DIR / "season_logo"
 RANK_FLAT_DIR = RESOURCE_DIR / "rank_flat"
-QUERY_TOOL_ASSET_DIR = RESOURCE_DIR / "query_tool_assets"
+QUERY_TOOL_ASSET_DIR = runtime_path("query_tool_assets")
 HISTORY_SUBTITLE = "历史段位"
 ROLE_ORDER = {"tank": 0, "dps": 1, "healer": 2, "open": 3}
 ROLE_LABELS = {

@@ -27,9 +27,13 @@ from .requests import (
     serialize_patch_candidate,
 )
 
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CACHE_ROOT = PROJECT_ROOT / "cache" / "patch_notes"
+
+DEFAULT_CACHE_ROOT = runtime_path("cache", "patch_notes")
 PATCH_NOTES_UNAVAILABLE_MESSAGE = "OW 补丁说明暂时不可用。"
 
 

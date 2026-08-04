@@ -44,6 +44,9 @@ _WINDOWS_LATIN_FALLBACKS = (
 
 
 def resolve_resource_dir() -> Path:
+    configured = str(os.getenv("OVERSTATS_RESOURCE_DIR", "")).strip()
+    if configured:
+        return Path(configured).expanduser()
     here = Path(__file__).resolve()
     candidates = (
         here.parents[2] / "res",

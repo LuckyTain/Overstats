@@ -7,7 +7,13 @@ import sqlite3
 from typing import Any, Iterable, Mapping, Optional
 
 
-OW_HERO_LEADERBOARD_DB_PATH = Path(__file__).resolve().parent / "ow_hero_leaderboard.sqlite3"
+try:
+    from overstats.src.runtime_paths import runtime_path
+except ModuleNotFoundError:
+    from src.runtime_paths import runtime_path
+
+
+OW_HERO_LEADERBOARD_DB_PATH = runtime_path("db", "ow_hero_leaderboard.sqlite3")
 HERO_LEADERBOARD_CN_TABLE = "hero_leaderboard_cn"
 HERO_LEADERBOARD_GLOBAL_TABLE = "hero_leaderboard_global"
 _VALID_TABLES = {HERO_LEADERBOARD_CN_TABLE, HERO_LEADERBOARD_GLOBAL_TABLE}

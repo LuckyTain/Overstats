@@ -9,7 +9,7 @@ USE_STREAM_RESPONSE = True
 ENABLE_DATABASE_WRITE = True
 
 # ======================= Dashen Upstream ====================== #
-# Configure at least one account.
+# Configure accounts through OVERSTATS_DASHEN_ACCOUNTS_JSON in production.
 DASHEN_ACCOUNTS = [
     {
         "name": "name",
@@ -46,7 +46,7 @@ DASHEN_NETEASE_PROXIES = [
 
 # OW esports PandaScore API key.
 #如何获取ow赛事的apikey:访问https://app.pandascore.co/dashboard/main，注册并生成api key，每小时1000次免费调用
-OW_ESPORTS_API_KEY = ""
+OW_ESPORTS_API_KEY = os.getenv("OVERSTATS_OW_ESPORTS_API_KEY", "")
 
 # Optional external OW guess asset pack root.
 # 仅存放本地图片/音频等大资源，默认放在 Overstats 项目目录外的相邻文件夹。
@@ -67,7 +67,7 @@ OW_HERO_LEADERBOARD_CN_SEASON = 3
 # - https://api.deepseek.com/v1
 # - https://generativelanguage.googleapis.com/v1beta/openai
 # You can also provide the full /chat/completions endpoint directly.
-ANALYSIS_BASE_URL = ""
+ANALYSIS_BASE_URL = os.getenv("OVERSTATS_ANALYSIS_BASE_URL", "")
 # Keep provider credentials outside the repository. Rotate any key that was
 # previously committed here before setting this environment variable.
 ANALYSIS_API_KEY = os.getenv("OVERSTATS_ANALYSIS_API_KEY", "")
@@ -77,11 +77,15 @@ ANALYSIS_PROXY = ""
 # ANALYSIS_GOOGLE_MODEL = "gemini-3.6-flash"
 #ANALYSIS_DEEPSEEK_MODEL = "deepseek-chat"
 #除谷歌和deepseek以外的模型使用下面配置
-ANALYSIS_OPENAI_MODEL = ""
+ANALYSIS_OPENAI_MODEL = os.getenv("OVERSTATS_ANALYSIS_MODEL", "")
 ANALYSIS_RATE_LIMIT_REQUESTS = 20
 ANALYSIS_RATE_LIMIT_WINDOW_SECONDS = 60
 ANALYSIS_CACHE_TTL_SECONDS = 86400
 ANALYSIS_CACHE_VERSION = "v1"
+ANALYSIS_JOB_MAX_CONCURRENT = 2
+ANALYSIS_JOB_MAX_QUEUED = 20
+ANALYSIS_JOB_TTL_SECONDS = 3600
+ALLOWED_ORIGINS = os.getenv("OVERSTATS_ALLOWED_ORIGINS", "")
 
 
 # Optional external patch-note fetch proxy.

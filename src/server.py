@@ -4,6 +4,7 @@ import asyncio
 import base64
 from collections.abc import Awaitable, Callable
 import locale
+import os
 import threading
 import time
 import uuid
@@ -14,6 +15,7 @@ from typing import Dict, Iterable, List, Optional, TypeVar
 
 try:
     from overstats.config import APIConfig
+    from overstats.config import config as app_config
     from overstats.src.client.apiclient import dashen_api_client
     from overstats.src.db.match_detail_recorder import MatchDetailRecorder
     from overstats.src.db.player_identity import PlayerIdentityRecorder
@@ -66,6 +68,7 @@ try:
     from overstats.src.http_server import resolve_http_ui_asset
 except ModuleNotFoundError:
     from config import APIConfig
+    from config import config as app_config
     from src.client.apiclient import dashen_api_client
     from src.db.match_detail_recorder import MatchDetailRecorder
     from src.db.player_identity import PlayerIdentityRecorder
@@ -158,6 +161,11 @@ def _coerce_optional_int(payload: Dict[str, object], *keys: str) -> Optional[int
 
 def _is_success_status(status: HTTPStatus) -> bool:
     return 200 <= int(status) < 300
+
+
+def _allowed_origins() -> set[str]:
+    raw = os.getenv("OVERSTATS_ALLOWED_ORIGINS", str(getattr(app_config, "ALLOWED_ORIGINS", "") or ""))
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 def _image_reply_from_binary(body: bytes, content_type: str) -> Dict[str, object]:
@@ -1296,6 +1304,12 @@ class OverstatsCoreService:
     async def handle_dashen_match_detail_analysis(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self._handle_dashen_match_detail_analysis(payload)
 
+    async def handle_dashen_match_detail_analysis_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self._handle_dashen_match_detail_analysis_job(payload)
+
+    async def handle_dashen_match_detail_analysis_job_status(self, job_id: str) -> Dict[str, object]:
+        return await self._handle_dashen_match_detail_analysis_job_status(job_id)
+
     async def handle_dashen_match_detail_analysis_prepare(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self._handle_dashen_match_detail_analysis_prepare(payload)
 
@@ -1304,6 +1318,9 @@ class OverstatsCoreService:
 
     async def handle_dashen_match_detail_analysis_byok_proxy(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self._handle_dashen_match_detail_analysis_byok_proxy(payload)
+
+    async def handle_dashen_match_detail_analysis_byok_proxy_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self._handle_dashen_match_detail_analysis_byok_proxy_job(payload)
 
     async def _handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -1460,6 +1477,15 @@ class OverstatsCoreService:
             "cache": result.cache,
         }
 
+    async def _handle_dashen_match_detail_analysis_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await dashen_match_module.create_match_detail_analysis_job(
+            customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+            match_id=str(payload.get("match_id") or payload.get("matchId") or "").strip(),
+        )
+
+    async def _handle_dashen_match_detail_analysis_job_status(self, job_id: str) -> Dict[str, object]:
+        return await dashen_match_module.get_analysis_job(job_id)
+
     async def _handle_dashen_match_detail_analysis_prepare(self, payload: Dict[str, object]) -> Dict[str, object]:
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
@@ -1472,6 +1498,15 @@ class OverstatsCoreService:
 
     async def _handle_dashen_match_detail_analysis_byok_proxy(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await dashen_match_module.proxy_match_detail_analysis(
+            customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+            match_id=str(payload.get("match_id") or payload.get("matchId") or "").strip(),
+            endpoint=str(payload.get("endpoint") or "").strip(),
+            model=str(payload.get("model") or "").strip(),
+            api_key=str(payload.get("api_key") or payload.get("apiKey") or ""),
+        )
+
+    async def _handle_dashen_match_detail_analysis_byok_proxy_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await dashen_match_module.create_byok_proxy_analysis_job(
             customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
             match_id=str(payload.get("match_id") or payload.get("matchId") or "").strip(),
             endpoint=str(payload.get("endpoint") or "").strip(),
@@ -1939,8 +1974,36 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             normalized = normalize_request_metric_url(self.path)
             return normalized.rstrip("/") or "/"
 
+        def _origin_allowed(self) -> bool:
+            origin = str(self.headers.get("Origin") or "").strip()
+            return not origin or origin in _allowed_origins()
+
+        def _send_cors_headers(self) -> None:
+            origin = str(self.headers.get("Origin") or "").strip()
+            if origin and origin in _allowed_origins():
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
+                self.send_header("Access-Control-Max-Age", "86400")
+                self.send_header("Access-Control-Expose-Headers", "X-Request-ID, Retry-After")
+                self.send_header("Vary", "Origin")
+
+        def do_OPTIONS(self) -> None:
+            self._begin_request()
+            if not self._origin_allowed():
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "origin_not_allowed", "message": "Origin is not allowed."})
+                return
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_cors_headers()
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:
             self._begin_request()
+            if not self._origin_allowed():
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "origin_not_allowed", "message": "Origin is not allowed."})
+                return
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
             if path == "/healthz":
@@ -1955,6 +2018,12 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                         "dashen_queue": service.dashen_request_queue.snapshot(),
                     },
                 )
+                return
+
+            analysis_job_prefix = "/api/v2/dashen-match/detail/analysis/jobs/"
+            if path.startswith(analysis_job_prefix):
+                job_id = path[len(analysis_job_prefix):].strip()
+                self._handle_dashen_match_detail_analysis_job_status_get(job_id)
                 return
 
             ui_asset = resolve_http_ui_asset(path)
@@ -1972,6 +2041,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
         def do_POST(self) -> None:
             self._begin_request()
+            if not self._origin_allowed():
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "origin_not_allowed", "message": "Origin is not allowed."})
+                return
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
             if path == "/api/v2/auto-route":
@@ -2132,6 +2204,14 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             if path == "/api/v2/dashen-match/detail/analysis":
                 self._handle_dashen_match_detail_analysis_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/analysis/jobs":
+                self._handle_dashen_match_detail_analysis_job_post()
+                return
+
+            if path == "/api/v2/dashen-match/detail/analysis/byok-proxy/jobs":
+                self._handle_dashen_match_detail_analysis_byok_proxy_job_post()
                 return
 
             if path == "/api/v2/dashen-match/detail/analysis/prepare":
@@ -4146,6 +4226,50 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             self._send_json(HTTPStatus.OK, result)
 
+        def _handle_dashen_match_detail_analysis_job_status_get(self, job_id: str) -> None:
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis_job_status(job_id))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error.", "details": {"exception": type(exc).__name__}})
+                return
+            status = HTTPStatus.TOO_MANY_REQUESTS if result.get("error") == "analysis_rate_limited" else HTTPStatus.OK
+            self._send_json(status, result)
+
+        def _handle_dashen_match_detail_analysis_job_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": str(exc)})
+                return
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis_job(payload))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error.", "details": {"exception": type(exc).__name__}})
+                return
+            self._send_json(HTTPStatus.ACCEPTED if result.get("status") in {"queued", "running"} else HTTPStatus.OK, result)
+
+        def _handle_dashen_match_detail_analysis_byok_proxy_job_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": str(exc)})
+                return
+            try:
+                result = async_runner.run(service.handle_dashen_match_detail_analysis_byok_proxy_job(payload))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message, "hint": exc.hint, "details": exc.details})
+                return
+            except Exception as exc:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal_error", "message": "Internal server error.", "details": {"exception": type(exc).__name__}})
+                return
+            self._send_json(HTTPStatus.ACCEPTED if result.get("status") in {"queued", "running"} else HTTPStatus.OK, result)
+
         def _handle_dashen_match_detail_analysis_post(self) -> None:
             try:
                 payload = self._read_json_body()
@@ -4470,6 +4594,8 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Request-ID", getattr(self, "_request_id", uuid.uuid4().hex))
+            self.send_header("Cache-Control", "no-store")
+            self._send_cors_headers()
             details = payload.get("details")
             retry_after = details.get("retry_after_seconds") if isinstance(details, dict) else None
             if retry_after:
@@ -4490,6 +4616,8 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Request-ID", getattr(self, "_request_id", uuid.uuid4().hex))
+            self.send_header("Cache-Control", "no-store")
+            self._send_cors_headers()
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -4507,6 +4635,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
             self.send_header("Transfer-Encoding", "chunked")
             self.send_header("Cache-Control", "no-cache")
+            self._send_cors_headers()
             self.end_headers()
 
             for item in events:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from typing import Any, Optional, Tuple
 
@@ -100,6 +101,12 @@ class DashenClientConfig:
 
 def _normalize_accounts() -> Tuple[DashenCredentialConfig, ...]:
     raw_accounts = getattr(config, "DASHEN_ACCOUNTS", [])
+    raw_env = os.getenv("OVERSTATS_DASHEN_ACCOUNTS_JSON", "").strip()
+    if raw_env:
+        try:
+            raw_accounts = json.loads(raw_env)
+        except json.JSONDecodeError as exc:
+            raise ValueError("OVERSTATS_DASHEN_ACCOUNTS_JSON must be valid JSON.") from exc
     normalized_accounts = []
     used_names = set()
     default_dts = _as_positive_int(getattr(config, "DASHEN_DTS", 2026), "DASHEN_DTS")
