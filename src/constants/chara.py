@@ -53,14 +53,16 @@ CHARA_NAME = {
     "飞天猫": ["jetpackcat", "Jetpack-cat", "jetpackcat", "jetpack-cat", "飞天猫", "耄耋", "哈基米", "猫", "猫猫", "豪猫", "键帽"],
     "瑞稀": ["mizuki", "Mizuki", "mizuki", "MIZUKI", "瑞稀", "瑞希", "斗笠男", "绿帽", "乌龟", "锁链男", "斗笠摩西", "河童", "镰刀男"],
     "西拉": ["sierra", "Sierra", "sierra", "SIERRA", "西拉", "鸟人", "拉稀", "埃科", "希拉", "茜拉", "拉西"],
-    "死怨": ["shion", "Shion", "shion", "SHION", "死怨"]
+    "死怨": ["shion", "Shion", "shion", "SHION", "死怨"],
+    "D.Mon": ["d.mon","D.Mon","d.mon","D.MON","D.Mon"]
 }
 
 RANK_DIST = {
     0: ["青铜", "bronze", "Bronze"],
     1: ["白银", "silver", "Silver"],
     2: ["黄金", "gold", "Gold"],
-    3: ["白金", "platium", "Platium", "铂金"],
+    3: ["白金", "platinum", "Platinum", "platium", "Platium", "铂金"],
+    8: ["翡翠", "emerald", "Emerald"],
     4: ["钻石", "diamond", "Diamond"],
     5: ["大师", "master", "Master", "带师"],
     6: ["宗师", "grandmaster", "Grandmaster", "GM", "gm"],
