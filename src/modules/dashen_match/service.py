@@ -403,6 +403,58 @@ def _sanitize_model_analysis_text(value: Any, fallback: str = "") -> str:
     return text or fallback
 
 
+def _build_match_outcome_context(match_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return server-verified winner/loser pools for the two match sides."""
+    result_value = match_data.get("matchRet")
+    try:
+        result = int(result_value)
+    except (TypeError, ValueError):
+        result = None
+
+    # matchRet is relative to the queried player's side. Some upstream
+    # payloads omit it, so use the recorded team scores as a conservative
+    # fallback when they are available.
+    if result is None:
+        try:
+            team_score = float(match_data.get("teamScore"))
+            opponent_score = float(match_data.get("opponentScore"))
+        except (TypeError, ValueError):
+            team_score = opponent_score = None
+        if team_score is not None and opponent_score is not None:
+            result = 1 if team_score > opponent_score else -1 if team_score < opponent_score else 0
+
+    if result == 1:
+        winning_team, losing_team, outcome = "teammate", "enemy", "win"
+    elif result == 0:
+        winning_team = losing_team = None
+        outcome = "draw"
+    elif result is not None:
+        winning_team, losing_team, outcome = "enemy", "teammate", "loss"
+    else:
+        winning_team = losing_team = None
+        outcome = "unknown"
+
+    team_players = {
+        "teammate": [
+            str(player.get("name") or "").strip()
+            for player in (match_data.get("teammateList") or [])
+            if isinstance(player, dict) and str(player.get("name") or "").strip()
+        ],
+        "enemy": [
+            str(player.get("name") or "").strip()
+            for player in (match_data.get("enemyList") or [])
+            if isinstance(player, dict) and str(player.get("name") or "").strip()
+        ],
+    }
+    return {
+        "result": outcome,
+        "winning_team": winning_team or "",
+        "losing_team": losing_team or "",
+        "winning_player_ids": team_players.get(winning_team, []) if winning_team else [],
+        "losing_player_ids": team_players.get(losing_team, []) if losing_team else [],
+    }
+
+
 def _build_match_stat_facts(
     match_data: Dict[str, Any],
     carry_index_data: List[Dict[str, Any]],
@@ -477,6 +529,7 @@ def _build_match_stat_facts(
         "player_count": len(players),
         "players": players,
         "extrema": extrema,
+        "match_outcome": _build_match_outcome_context(match_data),
     }
 
 
@@ -1646,6 +1699,7 @@ class DashenMatchModule:
         # are useful to the legacy image renderer but cannot be serialized.
         carry_index_data = build_carry_index_data(match_data, include_image_icons=False)
         match_stat_facts = _build_match_stat_facts(match_data, carry_index_data)
+        match_outcome = _build_match_outcome_context(match_data)
         try:
             hero_knowledge = build_match_hero_knowledge(match_data, all_player_details, _load_ow_config())
         except Exception as exc:
@@ -1662,6 +1716,7 @@ class DashenMatchModule:
             "{player_details}": detailed_text,
             "{carry_index_data}": json.dumps(carry_index_data, ensure_ascii=False),
             "{match_stat_facts}": json.dumps(match_stat_facts, ensure_ascii=False),
+            "{match_outcome}": json.dumps(match_outcome, ensure_ascii=False),
             "{attribute_scores}": json.dumps(score_bundle, ensure_ascii=False),
             "{hero_knowledge}": hero_knowledge_json,
         }
@@ -1677,8 +1732,8 @@ class DashenMatchModule:
             }],
             "match": {
                 "win_condition": {"title": "唯一胜负手", "analysis": "one decisive factor and evidence"},
-                "mvp": {"player_id": "exact BattleTag", "reason": "evidence"},
-                "liability": {"player_id": "exact BattleTag or empty string", "reason": "evidence or no clear liability"},
+                "mvp": {"player_id": "exact BattleTag from match_outcome.winning_player_ids", "reason": "evidence"},
+                "liability": {"player_id": "exact BattleTag from match_outcome.losing_player_ids; empty only for draw or unknown result", "reason": "evidence"},
                 "summary": "20-40 Chinese characters",
             },
         }
@@ -1701,7 +1756,9 @@ Do not cite, infer, or construct historical averages, medians, percentiles, glob
 This is a global review of all players. There is no focal player, favored player, or player that should receive extra attention. The request's customer token and target_id are data-fetching context only and must not influence ratings, MVP, liability, wording, or analysis priority.
 carry_index_data is already calculated and sorted by the server. Its score, overall_rank, team_rank, role_rank, and team_role_rank fields are authoritative. Never calculate, sort, compare, reinterpret, or contradict Carry Index. Do not mention Carry Index scores or comparisons in prose; the client renders them from structured fields.
 match_stat_facts is the only authority for claims such as match-high, match-low, team-high, team-low, most, least, highest, lowest, first, or last. Never infer an extreme from the prose tables. If multiple player_ids share an extremum, it is a tie and must not be described as a unique extreme.
-MVP and liability must be chosen from the whole roster. Liability may use an empty player_id when no single player is decisively responsible. Never default liability to the player whose token was used to fetch the match.
+For a win or loss, MVP MUST be selected from match_outcome.winning_player_ids and liability MUST be selected from match_outcome.losing_player_ids. Both player_id fields must be non-empty, and neither award may be selected from the other side. A draw or unknown result has no winning/losing pool; only in that case may liability use an empty player_id. Never default liability to the player whose token was used to fetch the match.
+The following server-verified outcome and candidate pools are authoritative:
+{json.dumps(match_outcome, ensure_ascii=False)}
 """.rstrip()
         prompt = f"""
 {persona_prompt}
@@ -1712,6 +1769,9 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
 
 [Server-verified global scoreboard facts: match_stat_facts]
 {json.dumps(match_stat_facts, ensure_ascii=False)}
+
+[Server-verified match outcome and award candidate pools: match_outcome]
+{json.dumps(match_outcome, ensure_ascii=False)}
 
 【查询方队伍属性评分 attribute_scores】
 {json.dumps(score_bundle, ensure_ascii=False)}
@@ -1837,6 +1897,9 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
             })
         players.sort(key=lambda item: int(item["carry_score"]), reverse=True)
         raw_match = raw.get("match") if isinstance(raw.get("match"), dict) else raw
+        match_outcome = _build_match_outcome_context(match_data)
+        winning_player_ids = list(match_outcome.get("winning_player_ids") or [])
+        losing_player_ids = list(match_outcome.get("losing_player_ids") or [])
 
         def card(value: Any, fallback_title: str) -> Dict[str, str]:
             source = value if isinstance(value, dict) else {}
@@ -1845,6 +1908,39 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
                 "player_id": str(source.get("player_id") or ""),
                 "reason": _sanitize_model_analysis_text(source.get("reason") or source.get("analysis") or value, "未返回有效结论。"),
             }
+
+        def default_player_id(player_ids: List[str], *, highest: bool) -> str:
+            if not player_ids:
+                return ""
+
+            def carry_score(player_id: str) -> int:
+                try:
+                    return int(carry_by_id.get(player_id.lower(), {}).get("score") or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            # sorted() is stable, so equal scores retain the upstream team
+            # order and produce deterministic fallback selections.
+            return sorted(player_ids, key=carry_score, reverse=highest)[0]
+
+        def restricted_card(
+            value: Any,
+            fallback_title: str,
+            *,
+            allowed_player_ids: List[str],
+            fallback_player_id: str = "",
+        ) -> Dict[str, str]:
+            result = card(value, fallback_title)
+            if not allowed_player_ids:
+                return result
+            canonical_ids = {player_id.lower(): player_id for player_id in allowed_player_ids}
+            selected_id = str(result.get("player_id") or "").strip()
+            canonical_id = canonical_ids.get(selected_id.lower())
+            if canonical_id:
+                result["player_id"] = canonical_id
+            elif fallback_player_id:
+                result["player_id"] = fallback_player_id
+            return result
 
         return {
             "schema_version": "v2",
@@ -1855,8 +1951,18 @@ MVP and liability must be chosen from the whole roster. Liability may use an emp
             "players": players,
             "match": {
                 "win_condition": card(raw_match.get("win_condition") or raw.get("key_to_win_loss"), "唯一胜负手"),
-                "mvp": card(raw_match.get("mvp"), "MVP"),
-                "liability": card(raw_match.get("liability") or raw_match.get("scapegoat"), "背锅位"),
+                "mvp": restricted_card(
+                    raw_match.get("mvp"),
+                    "MVP",
+                    allowed_player_ids=winning_player_ids,
+                    fallback_player_id=default_player_id(winning_player_ids, highest=True),
+                ),
+                "liability": restricted_card(
+                    raw_match.get("liability") or raw_match.get("scapegoat"),
+                    "背锅位",
+                    allowed_player_ids=losing_player_ids,
+                    fallback_player_id=default_player_id(losing_player_ids, highest=False),
+                ),
                 "summary": _sanitize_model_analysis_text(raw_match.get("summary") or raw.get("summary"), "未返回有效的一句话总结。"),
             },
         }
