@@ -94,6 +94,105 @@ _BYOK_CONTEXTS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _ANALYSIS_JOB_LOCK = asyncio.Lock()
 _ANALYSIS_JOB_SEMAPHORE_INSTANCE: Optional[asyncio.Semaphore] = None
 _ANALYSIS_JOBS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+
+def _hero_lookup_keys(value: Any) -> set[str]:
+    """Return comparable decimal and raw forms for hero ids from upstream/config."""
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    keys = {text}
+    try:
+        if text.lower().startswith("0x"):
+            keys.add(str(int(text, 16)))
+        elif text.isdigit():
+            keys.add(str(int(text)))
+    except (TypeError, ValueError):
+        pass
+    return keys
+
+
+def _build_hero_metadata_lookup(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for item in list(config.get("heroList") or []):
+        if not isinstance(item, dict):
+            continue
+        for key in ("heroGuid", "heroId", "guid", "id"):
+            for lookup_key in _hero_lookup_keys(item.get(key)):
+                lookup.setdefault(lookup_key, item)
+    return lookup
+
+
+def _enrich_hero_item(hero: Dict[str, Any], lookup: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    enriched = dict(hero)
+    hero_keys = set()
+    for key in ("heroGuid", "heroId", "hero_guid", "hero_id", "guid", "id"):
+        hero_keys.update(_hero_lookup_keys(hero.get(key)))
+    metadata = next((lookup[key] for key in hero_keys if key in lookup), {})
+
+    name = str(
+        hero.get("heroName")
+        or hero.get("hero_name")
+        or hero.get("name")
+        or metadata.get("name")
+        or ""
+    ).strip()
+    icon = str(
+        hero.get("heroIcon")
+        or hero.get("hero_icon")
+        or hero.get("smallIconUrl")
+        or hero.get("ddHeroIcon")
+        or hero.get("icon")
+        or metadata.get("smallIconUrl")
+        or metadata.get("ddHeroIcon")
+        or metadata.get("icon")
+        or ""
+    ).strip()
+    role = str(
+        hero.get("heroRole")
+        or hero.get("hero_role")
+        or hero.get("roleType")
+        or hero.get("role")
+        or metadata.get("roleType")
+        or metadata.get("role")
+        or ""
+    ).strip()
+
+    if name:
+        enriched["heroName"] = name
+    if icon:
+        enriched["heroIcon"] = icon
+    if role:
+        enriched["heroRole"] = role
+    return enriched
+
+
+def _enrich_match_detail_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach query_tool hero metadata without exposing the full config."""
+    config = _load_ow_config()
+    lookup = _build_hero_metadata_lookup(config)
+    if not lookup:
+        return payload
+
+    enriched = copy.deepcopy(payload)
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        for key, child in list(value.items()):
+            if key in {"heroList", "hero_list"} and isinstance(child, list):
+                value[key] = [
+                    _enrich_hero_item(item, lookup) if isinstance(item, dict) else item
+                    for item in child
+                ]
+            visit(value[key])
+
+    visit(enriched)
+    return enriched
 _ANALYSIS_JOB_KEYS: Dict[str, str] = {}
 _ANALYSIS_JOB_TASKS: Dict[str, asyncio.Task[Any]] = {}
 
@@ -586,6 +685,12 @@ class DashenMatchModule:
         render: bool = True,
     ) -> DashenMatchDetailOutput:
         detail = await self.requests.get_match_detail(customer_token, match)
+        detail = DashenMatchDetail(
+            match_id=detail.match_id,
+            match_kind=detail.match_kind,
+            payload=_enrich_match_detail_payload(detail.payload),
+            source_match=detail.source_match,
+        )
         image = None
         if render:
             enriched_detail = await self._hydrate_match_detail_risk_statuses(detail.payload)
@@ -615,6 +720,12 @@ class DashenMatchModule:
                 details={"index": index, "match_count": len(matches)},
             )
         detail = await self.requests.get_match_detail(query.customer_token, matches[index])
+        detail = DashenMatchDetail(
+            match_id=detail.match_id,
+            match_kind=detail.match_kind,
+            payload=_enrich_match_detail_payload(detail.payload),
+            source_match=detail.source_match,
+        )
         image = None
         if render:
             enriched_detail = await self._hydrate_match_detail_risk_statuses(detail.payload)
@@ -682,6 +793,12 @@ class DashenMatchModule:
                 )
             source_match = dict(matches[index])
             detail = await self.requests.get_match_detail(customer_token, source_match)
+        detail = DashenMatchDetail(
+            match_id=detail.match_id,
+            match_kind=detail.match_kind,
+            payload=_enrich_match_detail_payload(detail.payload),
+            source_match=detail.source_match,
+        )
 
         query_full_id = (
             (resolved_bnet.full_id if resolved_bnet else "")
@@ -1227,14 +1344,24 @@ class DashenMatchModule:
             payload = await self.requests.api_client.query_match_info(customer_token, match_id)
             root = _extract_match_detail_data(payload)
             if root.get("teammateList") or root.get("enemyList") or root.get("heroList"):
-                return DashenMatchDetail(match_id=match_id, match_kind="normal", payload=payload, source_match={})
+                return DashenMatchDetail(
+                    match_id=match_id,
+                    match_kind="normal",
+                    payload=_enrich_match_detail_payload(payload),
+                    source_match={},
+                )
         except Exception as exc:
             last_error = exc
         try:
             payload = await self.requests.api_client.fight_query_match_info(customer_token, match_id)
             root = _extract_match_detail_data(payload)
             if root.get("roundCountList") or root.get("totalCount") or root.get("teammateList") or root.get("enemyList"):
-                return DashenMatchDetail(match_id=match_id, match_kind="fight", payload=payload, source_match={})
+                return DashenMatchDetail(
+                    match_id=match_id,
+                    match_kind="fight",
+                    payload=_enrich_match_detail_payload(payload),
+                    source_match={},
+                )
         except Exception as exc:
             last_error = exc
         if last_error is not None:
@@ -1422,6 +1549,7 @@ class DashenMatchModule:
         if isinstance(cached, dict):
             return cached
         payload = await self.requests.api_client.query_match_info(customer_token, match_id)
+        payload = _enrich_match_detail_payload(payload)
         _cache_put(_PLAYER_DETAIL_CACHE, cache_key, payload, ttl=PLAYER_DETAIL_CACHE_TTL, max_size=PLAYER_DETAIL_CACHE_MAX)
         return payload
 
